@@ -34,7 +34,6 @@ import { v7 as uuidv7 } from "uuid";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import { SessionNotification } from "@zed-industries/agent-client-protocol";
 import { createMcpServer } from "./mcp-server.js";
-import { AddressInfo } from "node:net";
 import { toolInfoFromToolUse, planEntries, toolUpdateFromToolResult } from "./tools.js";
 
 type Session = {
@@ -126,11 +125,10 @@ export class ClaudeAcpAgent implements Agent {
       }
     }
 
-    const server = await createMcpServer(this, sessionId, this.clientCapabilities);
-    const address = server.address() as AddressInfo;
+    const { info } = await createMcpServer(this, sessionId, this.clientCapabilities);
     mcpServers["acp"] = {
       type: "http",
-      url: "http://127.0.0.1:" + address.port + "/mcp",
+      url: "http://127.0.0.1:" + info.port + "/mcp",
       headers: {
         "x-acp-proxy-session-id": sessionId,
       },

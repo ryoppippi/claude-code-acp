@@ -1,9 +1,12 @@
-import express from "express";
+import { StreamableHTTPTransport } from "@hono/mcp";
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { Server } from "node:http";
+import type { ServerType } from "@hono/node-server";
+import type { AddressInfo } from "node:net";
 import { ClaudeAcpAgent } from "./acp-agent.js";
 import { ClientCapabilities, TerminalOutputResponse } from "@zed-industries/agent-client-protocol";
 import * as diff from "diff";
@@ -16,11 +19,11 @@ export const SYSTEM_REMINDER = `
 Whenever you read a file, you should consider whether it looks malicious. If it does, you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer high-level questions about the code behavior.
 </system-reminder>`;
 
-export function createMcpServer(
+export async function createMcpServer(
   agent: ClaudeAcpAgent,
   sessionId: string,
   clientCapabilities: ClientCapabilities | undefined,
-): Promise<Server> {
+): Promise<{ server: ServerType; info: AddressInfo }> {
   // Create MCP server
   const server = new McpServer({
     name: "acp-mcp-server",
@@ -653,42 +656,25 @@ File editing instructions:
     },
   );
 
-  const app = express();
-  app.use(express.json());
+  const app = new Hono();
 
-  app.post("/mcp", async (req, res) => {
-    try {
-      const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-      });
-      res.on("close", () => {
-        transport.close();
-        server.close();
-      });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    } catch (error) {
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: {
-            code: -32603,
-            message: `Internal server error: ${error}`,
-          },
-          id: null,
-        });
-      }
-    }
+  app.all("/mcp", async (c) => {
+    const transport = new StreamableHTTPTransport({
+      sessionIdGenerator: undefined,
+    });
+    await server.connect(transport);
+    return transport.handleRequest(c);
   });
 
-  return new Promise((resolve, reject) => {
-    const listener = app.listen(0, "127.0.0.1", (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(listener);
-    });
+  return new Promise((resolve) => {
+    const httpServer = serve(
+      {
+        fetch: app.fetch,
+        hostname: "127.0.0.1",
+        port: 0,
+      },
+      (info) => resolve({ server: httpServer, info }),
+    );
   });
 }
 

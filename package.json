@@ -44,11 +44,12 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@anthropic-ai/claude-code": "^1.0.100",
+    "@hono/mcp": "^0.1.2",
+    "@hono/node-server": "^1.19.1",
     "@modelcontextprotocol/sdk": "^1.17.4",
-    "@types/express": "^5.0.3",
     "@zed-industries/agent-client-protocol": "0.2.0-alpha.6",
     "diff": "^8.0.2",
-    "express": "^5.1.0",
+    "hono": "^4.9.6",
     "minimist": "^1.2.8",
     "uuid": "11.1.0"
   },
