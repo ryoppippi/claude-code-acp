@@ -476,17 +476,7 @@ export function toolUpdateFromToolResult(
 
       if (supportsTerminalOutput) {
         return {
-          content: output.trim()
-            ? [
-                {
-                  type: "content",
-                  content: {
-                    type: "text",
-                    text: `\`\`\`sh\n${output.trimEnd()}\n\`\`\``,
-                  },
-                },
-              ]
-            : [],
+          content: [{ type: "terminal" as const, terminalId }],
           _meta: {
             terminal_info: {
               terminal_id: terminalId,
@@ -511,7 +501,7 @@ export function toolUpdateFromToolResult(
               type: "content",
               content: {
                 type: "text",
-                text: `\`\`\`sh\n${output.trimEnd()}\n\`\`\``,
+                text: `\`\`\`console\n${output.trimEnd()}\n\`\`\``,
               },
             },
           ],
