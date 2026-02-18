@@ -74,8 +74,6 @@ import {
   Pushable,
   unreachable,
 } from "./utils.js";
-import { createMcpServer } from "./mcp-server.js";
-import { EDIT_TOOL_NAMES, acpToolNames } from "./tools.js";
 import {
   toolInfoFromToolUse,
   planEntries,
@@ -83,7 +81,6 @@ import {
   ClaudePlanEntry,
   registerHookCallback,
   createPostToolUseHook,
-  createPreToolUseHook,
 } from "./tools.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -202,6 +199,19 @@ export type ToolUpdateMeta = {
     toolName: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
+  };
+  /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
+  terminal_info?: {
+    terminal_id: string;
+  };
+  terminal_output?: {
+    terminal_id: string;
+    data: string;
+  };
+  terminal_exit?: {
+    terminal_id: string;
+    exit_code: number;
+    signal: string | null;
   };
 };
 
@@ -665,6 +675,7 @@ export class ClaudeAcpAgent implements Agent {
             this.toolUseCache,
             this.client,
             this.logger,
+            { clientCapabilities: this.clientCapabilities },
           )) {
             await this.client.sessionUpdate(notification);
           }
@@ -693,6 +704,7 @@ export class ClaudeAcpAgent implements Agent {
                 this.toolUseCache,
                 this.client,
                 this.logger,
+                { clientCapabilities: this.clientCapabilities },
               )) {
                 await this.client.sessionUpdate(notification);
               }
@@ -743,6 +755,7 @@ export class ClaudeAcpAgent implements Agent {
             this.toolUseCache,
             this.client,
             this.logger,
+            { clientCapabilities: this.clientCapabilities },
           )) {
             await this.client.sessionUpdate(notification);
           }
@@ -863,7 +876,7 @@ export class ClaudeAcpAgent implements Agent {
           toolUseCache,
           this.client,
           this.logger,
-          { registerHooks: false },
+          { registerHooks: false, clientCapabilities: this.clientCapabilities },
         )) {
           await this.client.sessionUpdate(notification);
         }
@@ -885,6 +898,7 @@ export class ClaudeAcpAgent implements Agent {
 
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+      const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
         return {
@@ -909,7 +923,10 @@ export class ClaudeAcpAgent implements Agent {
           toolCall: {
             toolCallId: toolUseID,
             rawInput: toolInput,
-            title: toolInfoFromToolUse({ name: toolName, input: toolInput }).title,
+            ...toolInfoFromToolUse(
+              { name: toolName, input: toolInput, id: toolUseID },
+              supportsTerminalOutput,
+            ),
           },
         });
 
@@ -945,10 +962,7 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
 
-      if (
-        session.permissionMode === "bypassPermissions" ||
-        (session.permissionMode === "acceptEdits" && EDIT_TOOL_NAMES.includes(toolName))
-      ) {
+      if (session.permissionMode === "bypassPermissions") {
         return {
           behavior: "allow",
           updatedInput: toolInput,
@@ -972,7 +986,10 @@ export class ClaudeAcpAgent implements Agent {
         toolCall: {
           toolCallId: toolUseID,
           rawInput: toolInput,
-          title: toolInfoFromToolUse({ name: toolName, input: toolInput }).title,
+          ...toolInfoFromToolUse(
+            { name: toolName, input: toolInput, id: toolUseID },
+            supportsTerminalOutput,
+          ),
         },
       });
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -1070,16 +1087,6 @@ export class ClaudeAcpAgent implements Agent {
       }
     }
 
-    // Only add the acp MCP server if built-in tools are not disabled
-    if (!params._meta?.disableBuiltInTools) {
-      const server = createMcpServer(this, sessionId, this.clientCapabilities);
-      mcpServers["acp"] = {
-        type: "sdk",
-        name: "acp",
-        instance: server,
-      };
-    }
-
     let systemPrompt: Options["systemPrompt"] = { type: "preset", preset: "claude_code" };
     if (params._meta?.systemPrompt) {
       const customPrompt = params._meta.systemPrompt;
@@ -1104,6 +1111,30 @@ export class ClaudeAcpAgent implements Agent {
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
 
+    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
+    const disallowedTools = ["AskUserQuestion"];
+
+    // Check if built-in tools should be disabled
+    if (params._meta?.disableBuiltInTools === true) {
+      // When built-in tools are disabled, explicitly disallow all of them
+      disallowedTools.push(
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Glob",
+        "Grep",
+        "Task",
+        "TodoWrite",
+        "ExitPlanMode",
+        "WebSearch",
+        "WebFetch",
+        "SlashCommand",
+        "Skill",
+        "NotebookEdit",
+      );
+    }
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -1125,15 +1156,10 @@ export class ClaudeAcpAgent implements Agent {
       ...(process.env.CLAUDE_CODE_EXECUTABLE && {
         pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
       }),
+      disallowedTools,
       tools: { type: "preset", preset: "claude_code" },
       hooks: {
         ...userProvidedOptions?.hooks,
-        PreToolUse: [
-          ...(userProvidedOptions?.hooks?.PreToolUse || []),
-          {
-            hooks: [createPreToolUseHook(settingsManager, this.logger)],
-          },
-        ],
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
@@ -1163,61 +1189,6 @@ export class ClaudeAcpAgent implements Agent {
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
       options.sessionId = sessionId;
-    }
-
-    const allowedTools = [];
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
-
-    // Check if built-in tools should be disabled
-    const disableBuiltInTools = params._meta?.disableBuiltInTools === true;
-
-    if (!disableBuiltInTools) {
-      if (this.clientCapabilities?.fs?.readTextFile) {
-        allowedTools.push(acpToolNames.read);
-        disallowedTools.push("Read");
-      }
-      if (this.clientCapabilities?.fs?.writeTextFile) {
-        disallowedTools.push("Write", "Edit");
-      }
-      if (this.clientCapabilities?.terminal) {
-        allowedTools.push(acpToolNames.bashOutput, acpToolNames.killShell);
-        disallowedTools.push("Bash", "BashOutput", "KillShell");
-      }
-    } else {
-      // When built-in tools are disabled, explicitly disallow all of them
-      disallowedTools.push(
-        acpToolNames.read,
-        acpToolNames.write,
-        acpToolNames.edit,
-        acpToolNames.bash,
-        acpToolNames.bashOutput,
-        acpToolNames.killShell,
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "BashOutput",
-        "KillShell",
-        "Glob",
-        "Grep",
-        "Task",
-        "TodoWrite",
-        "ExitPlanMode",
-        "WebSearch",
-        "WebFetch",
-        "AskUserQuestion",
-        "SlashCommand",
-        "Skill",
-        "NotebookEdit",
-      );
-    }
-
-    if (allowedTools.length > 0) {
-      options.allowedTools = allowedTools;
-    }
-    if (disallowedTools.length > 0) {
-      options.disallowedTools = [...(options.disallowedTools || []), ...disallowedTools];
     }
 
     // Handle abort controller from meta options
@@ -1460,9 +1431,10 @@ export function toAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
-  options?: { registerHooks?: boolean },
+  options?: { registerHooks?: boolean; clientCapabilities?: ClientCapabilities },
 ): SessionNotification[] {
   const registerHooks = options?.registerHooks !== false;
+  const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
     return [
       {
@@ -1517,6 +1489,7 @@ export function toAcpNotifications(
       case "tool_use":
       case "server_tool_use":
       case "mcp_tool_use": {
+        const alreadyCached = chunk.id in toolUseCache;
         toolUseCache[chunk.id] = chunk;
         if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object
@@ -1527,7 +1500,8 @@ export function toAcpNotifications(
             };
           }
         } else {
-          if (registerHooks) {
+          // Only register hooks on first encounter to avoid double-firing
+          if (registerHooks && !alreadyCached) {
             registerHookCallback(chunk.id, {
               onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
                 const toolUse = toolUseCache[toolUseId];
@@ -1561,18 +1535,41 @@ export function toAcpNotifications(
           } catch {
             // ignore if we can't turn it to JSON
           }
-          update = {
-            _meta: {
-              claudeCode: {
-                toolName: chunk.name,
-              },
-            } satisfies ToolUpdateMeta,
-            toolCallId: chunk.id,
-            sessionUpdate: "tool_call",
-            rawInput,
-            status: "pending",
-            ...toolInfoFromToolUse(chunk),
-          };
+
+          if (alreadyCached) {
+            // Second encounter (full assistant message after streaming) —
+            // send as tool_call_update to refine the existing tool_call
+            // rather than emitting a duplicate tool_call.
+            update = {
+              _meta: {
+                claudeCode: {
+                  toolName: chunk.name,
+                },
+              } satisfies ToolUpdateMeta,
+              toolCallId: chunk.id,
+              sessionUpdate: "tool_call_update",
+              rawInput,
+              ...toolInfoFromToolUse(chunk, supportsTerminalOutput),
+            };
+          } else {
+            // First encounter (streaming content_block_start or replay) —
+            // send as tool_call with terminal_info for Bash tools.
+            update = {
+              _meta: {
+                claudeCode: {
+                  toolName: chunk.name,
+                },
+                ...(chunk.name === "Bash" && supportsTerminalOutput
+                  ? { terminal_info: { terminal_id: chunk.id } }
+                  : {}),
+              } satisfies ToolUpdateMeta,
+              toolCallId: chunk.id,
+              sessionUpdate: "tool_call",
+              rawInput,
+              status: "pending",
+              ...toolInfoFromToolUse(chunk, supportsTerminalOutput),
+            };
+          }
         }
         break;
       }
@@ -1594,17 +1591,42 @@ export function toAcpNotifications(
         }
 
         if (toolUse.name !== "TodoWrite") {
+          const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
+            chunk,
+            toolUseCache[chunk.tool_use_id],
+            supportsTerminalOutput,
+          );
+
+          // When terminal output is supported, send terminal_output as a
+          // separate notification to match codex-acp's streaming lifecycle:
+          //   1. tool_call       → _meta.terminal_info  (already sent above)
+          //   2. tool_call_update → _meta.terminal_output (sent here)
+          //   3. tool_call_update → _meta.terminal_exit  (sent below with status)
+          if (toolMeta?.terminal_output) {
+            output.push({
+              sessionId,
+              update: {
+                _meta: {
+                  terminal_output: toolMeta.terminal_output,
+                },
+                toolCallId: chunk.tool_use_id,
+                sessionUpdate: "tool_call_update" as const,
+              },
+            });
+          }
+
           update = {
             _meta: {
               claudeCode: {
                 toolName: toolUse.name,
               },
+              ...(toolMeta?.terminal_exit ? { terminal_exit: toolMeta.terminal_exit } : {}),
             } satisfies ToolUpdateMeta,
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
             rawOutput: chunk.content,
-            ...toolUpdateFromToolResult(chunk, toolUseCache[chunk.tool_use_id]),
+            ...toolUpdate,
           };
         }
         break;
@@ -1639,6 +1661,7 @@ export function streamEventToAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
+  options?: { clientCapabilities?: ClientCapabilities },
 ): SessionNotification[] {
   const event = message.event;
   switch (event.type) {
@@ -1650,6 +1673,7 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
+        { clientCapabilities: options?.clientCapabilities },
       );
     case "content_block_delta":
       return toAcpNotifications(
@@ -1659,6 +1683,7 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
+        { clientCapabilities: options?.clientCapabilities },
       );
     // No content
     case "message_start":
