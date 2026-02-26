@@ -640,7 +640,10 @@ export class ClaudeAcpAgent implements Agent {
             this.toolUseCache,
             this.client,
             this.logger,
-            { clientCapabilities: this.clientCapabilities },
+            {
+              clientCapabilities: this.clientCapabilities,
+              parentToolUseId: message.parent_tool_use_id,
+            },
           )) {
             await this.client.sessionUpdate(notification);
           }
@@ -1393,23 +1396,34 @@ export function toAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
-  options?: { registerHooks?: boolean; clientCapabilities?: ClientCapabilities },
+  options?: {
+    registerHooks?: boolean;
+    clientCapabilities?: ClientCapabilities;
+    parentToolUseId?: string | null;
+  },
 ): SessionNotification[] {
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
-    return [
-      {
-        sessionId,
-        update: {
-          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-          content: {
-            type: "text",
-            text: content,
-          },
-        },
+    const update: SessionNotification["update"] = {
+      sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+      content: {
+        type: "text",
+        text: content,
       },
-    ];
+    };
+
+    if (options?.parentToolUseId) {
+      update._meta = {
+        ...update._meta,
+        claudeCode: {
+          ...(update._meta?.claudeCode || {}),
+          parentToolUseId: options.parentToolUseId,
+        },
+      };
+    }
+
+    return [{ sessionId, update }];
   }
 
   const output = [];
@@ -1573,6 +1587,9 @@ export function toAcpNotifications(
               update: {
                 _meta: {
                   terminal_output: toolMeta.terminal_output,
+                  ...(options?.parentToolUseId
+                    ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
+                    : {}),
                 },
                 toolCallId: chunk.tool_use_id,
                 sessionUpdate: "tool_call_update" as const,
@@ -1613,6 +1630,15 @@ export function toAcpNotifications(
         break;
     }
     if (update) {
+      if (options?.parentToolUseId) {
+        update._meta = {
+          ...update._meta,
+          claudeCode: {
+            ...(update._meta?.claudeCode || {}),
+            parentToolUseId: options.parentToolUseId,
+          },
+        };
+      }
       output.push({ sessionId, update });
     }
   }
@@ -1638,7 +1664,10 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
-        { clientCapabilities: options?.clientCapabilities },
+        {
+          clientCapabilities: options?.clientCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+        },
       );
     case "content_block_delta":
       return toAcpNotifications(
@@ -1648,7 +1677,10 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
-        { clientCapabilities: options?.clientCapabilities },
+        {
+          clientCapabilities: options?.clientCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+        },
       );
     // No content
     case "message_start":
