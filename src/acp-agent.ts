@@ -134,12 +134,20 @@ export interface Logger {
   error: (...args: any[]) => void;
 }
 
+type AccumulatedUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cachedWriteTokens: number;
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
+  accumulatedUsage: AccumulatedUsage;
   configOptions: SessionConfigOption[];
 };
 
@@ -407,6 +415,14 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     this.sessions[params.sessionId].cancelled = false;
+    this.sessions[params.sessionId].accumulatedUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    };
+
+    let lastAssistantTotalUsage: number | null = null;
 
     const { query, input } = this.sessions[params.sessionId];
 
@@ -423,6 +439,11 @@ export class ClaudeAcpAgent implements Agent {
 
       switch (message.type) {
         case "system":
+          if (message.subtype === "compact_boundary") {
+            // We don't know the exact size, but since we compacted,
+            // we set it to zero. The client gets the exact size on the next message.
+            lastAssistantTotalUsage = 0;
+          }
           switch (message.subtype) {
             case "init":
               break;
@@ -447,6 +468,47 @@ export class ClaudeAcpAgent implements Agent {
             return { stopReason: "cancelled" };
           }
 
+          // Accumulate usage from this result
+          const session = this.sessions[params.sessionId];
+          session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+          session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+          session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+          session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+
+          // Calculate context window size from modelUsage (minimum across all models used)
+          const contextWindows = Object.values(message.modelUsage).map((m) => m.contextWindow);
+          const contextWindowSize =
+            contextWindows.length > 0 ? Math.min(...contextWindows) : 200000;
+
+          // Send usage_update notification
+          if (lastAssistantTotalUsage !== null) {
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "usage_update",
+                used: lastAssistantTotalUsage,
+                size: contextWindowSize,
+                cost: {
+                  amount: message.total_cost_usd,
+                  currency: "USD",
+                },
+              },
+            });
+          }
+
+          // Build the usage response
+          const usage: PromptResponse["usage"] = {
+            inputTokens: session.accumulatedUsage.inputTokens,
+            outputTokens: session.accumulatedUsage.outputTokens,
+            cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
+            cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
+            totalTokens:
+              session.accumulatedUsage.inputTokens +
+              session.accumulatedUsage.outputTokens +
+              session.accumulatedUsage.cachedReadTokens +
+              session.accumulatedUsage.cachedWriteTokens,
+          };
+
           switch (message.subtype) {
             case "success": {
               if (message.result.includes("Please run /login")) {
@@ -455,7 +517,7 @@ export class ClaudeAcpAgent implements Agent {
               if (message.is_error) {
                 throw RequestError.internalError(undefined, message.result);
               }
-              return { stopReason: "end_turn" };
+              return { stopReason: "end_turn", usage };
             }
             case "error_during_execution":
               if (message.is_error) {
@@ -464,7 +526,7 @@ export class ClaudeAcpAgent implements Agent {
                   message.errors.join(", ") || message.subtype,
                 );
               }
-              return { stopReason: "end_turn" };
+              return { stopReason: "end_turn", usage };
             case "error_max_budget_usd":
             case "error_max_turns":
             case "error_max_structured_output_retries":
@@ -474,7 +536,7 @@ export class ClaudeAcpAgent implements Agent {
                   message.errors.join(", ") || message.subtype,
                 );
               }
-              return { stopReason: "max_turn_requests" };
+              return { stopReason: "max_turn_requests", usage };
             default:
               unreachable(message, this.logger);
               break;
@@ -498,6 +560,16 @@ export class ClaudeAcpAgent implements Agent {
         case "assistant": {
           if (this.sessions[params.sessionId].cancelled) {
             break;
+          }
+
+          // Store latest assistant usage (excluding subagents)
+          if ((message.message as any).usage && message.parent_tool_use_id === null) {
+            const messageWithUsage = message.message as unknown as SDKResultMessage;
+            lastAssistantTotalUsage =
+              messageWithUsage.usage.input_tokens +
+              messageWithUsage.usage.output_tokens +
+              messageWithUsage.usage.cache_read_input_tokens +
+              messageWithUsage.usage.cache_creation_input_tokens;
           }
 
           // Slash commands like /compact can generate invalid output... doesn't match
@@ -978,7 +1050,6 @@ export class ClaudeAcpAgent implements Agent {
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
-      stderr: (err) => this.logger.error(err),
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
       // Override certain fields that must be controlled by ACP
@@ -1052,6 +1123,12 @@ export class ClaudeAcpAgent implements Agent {
       cancelled: false,
       permissionMode,
       settingsManager,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
       configOptions: [],
     };
 
