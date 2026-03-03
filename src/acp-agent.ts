@@ -2,6 +2,7 @@ import {
   Agent,
   AgentSideConnection,
   AuthenticateRequest,
+  AuthMethod,
   AvailableCommand,
   CancelNotification,
   ClientCapabilities,
@@ -153,6 +154,34 @@ export type NewSessionMeta = {
 };
 
 /**
+ * Extended ClientCapabilities with `auth` field.
+ * TODO: Remove once `auth` is added to the ACP SDK schema.
+ */
+type ClientCapabilitiesWithAuth = ClientCapabilities & {
+  auth?: {
+    _meta?: {
+      gateway?: boolean;
+    };
+  };
+};
+
+/**
+ * Extra metadata for 'gateway' authentication requests.
+ */
+type GatewayAuthMeta = {
+  /**
+   * These parameters are mapped to environment variables to:
+   * - Redirect API calls via baseUrl
+   * - Inject custom headers
+   * - Bypass the default Claude login requirement
+   */
+  gateway: {
+    baseUrl: string;
+    headers: Record<string, string>;
+  };
+};
+
+/**
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
@@ -188,6 +217,10 @@ export type ToolUseCache = {
 
 function isStaticBinary(): boolean {
   return process.env.CLAUDE_AGENT_ACP_IS_SINGLE_FILE_BUN !== undefined;
+}
+
+function shouldHideClaudeAuth(): boolean {
+  return process.argv.includes("--hide-claude-auth");
 }
 
 // Bypass Permissions doesn't work if we are a root/sudo user
@@ -241,6 +274,7 @@ export class ClaudeAcpAgent implements Agent {
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
+  gatewayAuthMeta?: GatewayAuthMeta;
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
@@ -259,8 +293,25 @@ export class ClaudeAcpAgent implements Agent {
       id: "claude-login",
     };
 
+    // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
+    // Only offered when the client advertises `auth._meta.gateway` capability.
+    const clientCaps = request.clientCapabilities as ClientCapabilitiesWithAuth | undefined;
+    const supportsGatewayAuth = clientCaps?.auth?._meta?.gateway === true;
+
+    const gatewayAuthMethod: AuthMethod = {
+      id: "gateway",
+      name: "Custom model gateway",
+      description: "Use a custom gateway to authenticate and access models",
+      _meta: {
+        gateway: {
+          protocol: "anthropic",
+        },
+      },
+    };
+
     // If client supports terminal-auth capability, use that instead.
-    if (request.clientCapabilities?._meta?.["terminal-auth"] === true) {
+    const supportsTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
+    if (supportsTerminalAuth) {
       let command: string;
       let args: string[];
 
@@ -310,12 +361,17 @@ export class ClaudeAcpAgent implements Agent {
         title: "Claude Agent",
         version: packageJson.version,
       },
-      authMethods: [authMethod],
+      authMethods: [
+        // Terminal auth can also be used for API keys, so don't gate it on --hide-claude-auth.
+        ...(shouldHideClaudeAuth() && !supportsTerminalAuth ? [] : [authMethod]),
+        ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
+      ],
     };
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (
+      !this.gatewayAuthMeta &&
       fs.existsSync(path.resolve(os.homedir(), ".claude.json.backup")) &&
       !fs.existsSync(path.resolve(os.homedir(), ".claude.json"))
     ) {
@@ -415,6 +471,10 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async authenticate(_params: AuthenticateRequest): Promise<void> {
+    if (_params.methodId === "gateway") {
+      this.gatewayAuthMeta = _params._meta as GatewayAuthMeta | undefined;
+      return;
+    }
     throw new Error("Method not implemented.");
   }
 
@@ -1179,6 +1239,10 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
+      env: {
+        ...userProvidedOptions?.env,
+        ...createEnvForGateway(this.gatewayAuthMeta),
+      },
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
       includePartialMessages: true,
@@ -1262,6 +1326,13 @@ export class ClaudeAcpAgent implements Agent {
       throw error;
     }
 
+    if (shouldHideClaudeAuth() && initializationResult.account.subscriptionType) {
+      throw RequestError.authRequired(
+        undefined,
+        "This integration does not support using claude.ai subscriptions.",
+      );
+    }
+
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 
     const availableModes = [
@@ -1327,6 +1398,19 @@ export class ClaudeAcpAgent implements Agent {
       configOptions,
     };
   }
+}
+
+function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
+  if (!gatewayMeta) {
+    return {};
+  }
+  return {
+    ANTHROPIC_BASE_URL: gatewayMeta.gateway.baseUrl,
+    ANTHROPIC_CUSTOM_HEADERS: Object.entries(gatewayMeta.gateway.headers)
+      .map(([key, value]) => `${key}: ${value}`)
+      .join("\n"),
+    ANTHROPIC_AUTH_TOKEN: "", // Must be specified to bypass claude login requirement
+  };
 }
 
 function buildConfigOptions(
