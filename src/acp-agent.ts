@@ -543,12 +543,18 @@ export class ClaudeAcpAgent implements Agent {
                 if (message.result.includes("Please run /login")) {
                   throw RequestError.authRequired();
                 }
+                if (message.stop_reason === "max_tokens") {
+                  return { stopReason: "max_tokens", usage };
+                }
                 if (message.is_error) {
                   throw RequestError.internalError(undefined, message.result);
                 }
                 return { stopReason: "end_turn", usage };
               }
               case "error_during_execution":
+                if (message.stop_reason === "max_tokens") {
+                  return { stopReason: "max_tokens", usage };
+                }
                 if (message.is_error) {
                   throw RequestError.internalError(
                     undefined,
