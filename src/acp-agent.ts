@@ -711,6 +711,27 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
       throw new Error("Session did not end in result");
+    } catch (error) {
+      if (error instanceof RequestError || !(error instanceof Error)) {
+        throw error;
+      }
+      const message = error.message;
+      if (
+        message.includes("ProcessTransport") ||
+        message.includes("terminated process") ||
+        message.includes("process exited with") ||
+        message.includes("process terminated by signal") ||
+        message.includes("Failed to write to process stdin")
+      ) {
+        this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
+        session.input.end();
+        delete this.sessions[params.sessionId];
+        throw RequestError.internalError(
+          undefined,
+          "The Claude Agent process exited unexpectedly. Please start a new session.",
+        );
+      }
+      throw error;
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
