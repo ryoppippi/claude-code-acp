@@ -1218,7 +1218,19 @@ export class ClaudeAcpAgent implements Agent {
       nextPendingOrder: 0,
     };
 
-    const initializationResult = await q.initializationResult();
+    let initializationResult;
+    try {
+      initializationResult = await q.initializationResult();
+    } catch (error) {
+      if (
+        creationOpts.resume &&
+        error instanceof Error &&
+        error.message === "Query closed before response received"
+      ) {
+        throw RequestError.resourceNotFound(sessionId);
+      }
+      throw error;
+    }
 
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 
