@@ -149,6 +149,7 @@ export type NewSessionMeta = {
      *   - hooks (merged with ACP's hooks)
      *   - mcpServers (merged with ACP's mcpServers)
      *   - disallowedTools (merged with ACP's disallowedTools)
+     *   - tools (passed through; defaults to claude_code preset if not provided)
      */
     options?: Options;
   };
@@ -1248,26 +1249,13 @@ export class ClaudeAcpAgent implements Agent {
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
 
-    // Check if built-in tools should be disabled
-    if (params._meta?.disableBuiltInTools === true) {
-      // When built-in tools are disabled, explicitly disallow all of them
-      disallowedTools.push(
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "Glob",
-        "Grep",
-        "Task",
-        "TodoWrite",
-        "ExitPlanMode",
-        "WebSearch",
-        "WebFetch",
-        "SlashCommand",
-        "Skill",
-        "NotebookEdit",
-      );
-    }
+    // Resolve which built-in tools to expose.
+    // Explicit tools array from _meta.claudeCode.options takes precedence.
+    // disableBuiltInTools is a legacy shorthand for tools: [] — kept for
+    // backward compatibility but callers should prefer the tools array.
+    const tools: Options["tools"] =
+      userProvidedOptions?.tools ??
+      (params._meta?.disableBuiltInTools === true ? [] : { type: "preset", preset: "claude_code" });
 
     const options: Options = {
       systemPrompt,
@@ -1302,7 +1290,7 @@ export class ClaudeAcpAgent implements Agent {
         "replay-user-messages": "",
       },
       disallowedTools: [...(userProvidedOptions?.disallowedTools || []), ...disallowedTools],
-      tools: { type: "preset", preset: "claude_code" },
+      tools,
       hooks: {
         ...userProvidedOptions?.hooks,
         PostToolUse: [
