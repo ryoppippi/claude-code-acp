@@ -1025,16 +1025,25 @@ export class ClaudeAcpAgent implements Agent {
       }
 
       if (toolName === "ExitPlanMode") {
+        const options = [
+          {
+            kind: "allow_always",
+            name: "Yes, and auto-accept edits",
+            optionId: "acceptEdits",
+          },
+          { kind: "allow_once", name: "Yes, and manually approve edits", optionId: "default" },
+          { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
+        ];
+        if (ALLOW_BYPASS) {
+          options.unshift({
+            kind: "allow_always",
+            name: "Yes, and bypass permissions",
+            optionId: "bypassPermissions",
+          });
+        }
+
         const response = await this.client.requestPermission({
-          options: [
-            {
-              kind: "allow_always",
-              name: "Yes, and auto-accept edits",
-              optionId: "acceptEdits",
-            },
-            { kind: "allow_once", name: "Yes, and manually approve edits", optionId: "default" },
-            { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
-          ],
+          options,
           sessionId,
           toolCall: {
             toolCallId: toolUseID,
@@ -1052,7 +1061,9 @@ export class ClaudeAcpAgent implements Agent {
         }
         if (
           response.outcome?.outcome === "selected" &&
-          (response.outcome.optionId === "default" || response.outcome.optionId === "acceptEdits")
+          (response.outcome.optionId === "default" ||
+            response.outcome.optionId === "acceptEdits" ||
+            response.outcome.optionId === "bypassPermissions")
         ) {
           session.permissionMode = response.outcome.optionId;
           await this.client.sessionUpdate({
