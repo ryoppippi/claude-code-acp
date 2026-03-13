@@ -34,6 +34,8 @@ import {
   SetSessionModelResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
+  CloseSessionRequest,
+  CloseSessionResponse,
   TerminalHandle,
   TerminalOutputResponse,
   WriteTextFileRequest,
@@ -117,6 +119,7 @@ type Session = {
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
+  abortController: AbortController;
 };
 
 type BackgroundTerminal =
@@ -338,6 +341,7 @@ export class ClaudeAcpAgent implements Agent {
           fork: {},
           list: {},
           resume: {},
+          close: {},
         },
       },
       agentInfo: {
@@ -844,6 +848,19 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.interrupt();
   }
 
+  async unstable_sessionClose(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+    await this.cancel({ sessionId: params.sessionId });
+
+    session.abortController.abort();
+    delete this.sessions[params.sessionId];
+
+    return {};
+  }
+
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
@@ -870,6 +887,9 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
+    }
+    if (typeof params.value !== "string") {
+      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
     }
 
     const option = session.configOptions.find((o) => o.id === params.configId);
@@ -900,7 +920,9 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.configOptions = session.configOptions.map((o) =>
-      o.id === params.configId ? { ...o, currentValue: params.value } : o,
+      o.id === params.configId && typeof o.currentValue === "string"
+        ? { ...o, currentValue: params.value }
+        : o,
     );
 
     return { configOptions: session.configOptions };
@@ -1125,7 +1147,7 @@ export class ClaudeAcpAgent implements Agent {
     if (!session) return;
 
     session.configOptions = session.configOptions.map((o) =>
-      o.id === configId ? { ...o, currentValue: value } : o,
+      o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
     );
 
     await this.client.sessionUpdate({
@@ -1220,6 +1242,8 @@ export class ClaudeAcpAgent implements Agent {
       userProvidedOptions?.tools ??
       (params._meta?.disableBuiltInTools === true ? [] : { type: "preset", preset: "claude_code" });
 
+    const abortController = userProvidedOptions?.abortController || new AbortController();
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -1280,6 +1304,7 @@ export class ClaudeAcpAgent implements Agent {
         ],
       },
       ...creationOpts,
+      abortController,
     };
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
@@ -1288,7 +1313,6 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     // Handle abort controller from meta options
-    const abortController = userProvidedOptions?.abortController;
     if (abortController?.signal.aborted) {
       throw new Error("Cancelled");
     }
@@ -1376,6 +1400,7 @@ export class ClaudeAcpAgent implements Agent {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      abortController,
     };
 
     return {
