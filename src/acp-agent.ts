@@ -156,6 +156,7 @@ export type NewSessionMeta = {
      */
     options?: Options;
   };
+  additionalRoots?: string[];
 };
 
 /**
@@ -1299,7 +1300,8 @@ export class ClaudeAcpAgent implements Agent {
     );
 
     // Extract options from _meta if provided
-    const userProvidedOptions = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
+    const sessionMeta = params._meta as NewSessionMeta | undefined;
+    const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
@@ -1377,6 +1379,11 @@ export class ClaudeAcpAgent implements Agent {
       ...creationOpts,
       abortController,
     };
+
+    options.additionalDirectories = [
+      ...(userProvidedOptions?.additionalDirectories ?? []),
+      ...(sessionMeta?.additionalRoots ?? []),
+    ];
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
