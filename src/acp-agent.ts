@@ -991,6 +991,11 @@ export class ClaudeAcpAgent implements Agent {
     delete this.sessions[sessionId];
   }
 
+  /** Tear down all active sessions. Called when the ACP connection closes. */
+  async dispose(): Promise<void> {
+    await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+  }
+
   async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
@@ -2285,7 +2290,12 @@ export function runAcp() {
   const output = nodeToWebReadable(process.stdin);
 
   const stream = ndJsonStream(input, output);
-  new AgentSideConnection((client) => new ClaudeAcpAgent(client), stream);
+  let agent!: ClaudeAcpAgent;
+  const connection = new AgentSideConnection((client) => {
+    agent = new ClaudeAcpAgent(client);
+    return agent;
+  }, stream);
+  return { connection, agent };
 }
 
 function commonPrefixLength(a: string, b: string) {
