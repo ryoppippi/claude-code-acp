@@ -1336,6 +1336,7 @@ describe("stop reason propagation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1478,6 +1479,7 @@ describe("stop reason propagation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1554,6 +1556,7 @@ describe("session/close", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1649,6 +1652,7 @@ describe("getOrCreateSession param change detection", () => {
       }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1882,6 +1886,7 @@ describe("usage_update computation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: {} as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -2235,7 +2240,7 @@ describe("usage_update computation", () => {
     const session = agent.sessions["test-session"];
     expect(session.contextWindowSize).toBe(200000);
 
-    (agent as any).syncSessionConfigState(session, "model", "claude-opus-4-6-1m");
+    await (agent as any).applyConfigOptionValue(session, "model", "claude-opus-4-6-1m");
     expect(session.contextWindowSize).toBe(1000000);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2286,7 +2291,7 @@ describe("usage_update computation", () => {
   it("switching the session's model invalidates the learned context window", async () => {
     // When the user switches models mid-session, the window learned for the
     // previous model would otherwise persist into the next prompt's first
-    // mid-stream update. syncSessionConfigState should reset it so the next
+    // mid-stream update. applyConfigOptionValue should reset it so the next
     // turn's first update falls back to the heuristic (here: 200k default).
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -2320,7 +2325,7 @@ describe("usage_update computation", () => {
     session.models = { ...session.models, currentModelId: "claude-opus-4-6-1m" };
 
     // User flips the selector to a 200k model.
-    (agent as any).syncSessionConfigState(session, "model", "claude-sonnet-4-6");
+    await (agent as any).applyConfigOptionValue(session, "model", "claude-sonnet-4-6");
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -2770,6 +2775,7 @@ describe("emitRawSDKMessages", () => {
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,

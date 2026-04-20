@@ -53,6 +53,7 @@ import {
   PermissionMode,
   Query,
   query,
+  Settings,
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
@@ -135,6 +136,7 @@ type Session = {
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
   models: SessionModelState;
+  modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
@@ -1088,11 +1090,17 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
-    await this.sessions[params.sessionId].query.setModel(params.modelId);
-    await this.updateConfigOption(params.sessionId, "model", params.modelId);
+    // Resolve aliases (e.g. "opus", "opus[1m]") to canonical model IDs so
+    // downstream lookups in modelInfos succeed and the effort option isn't
+    // silently dropped.
+    const resolved = resolveModelPreference(session.modelInfos, params.modelId);
+    const modelId = resolved?.value ?? params.modelId;
+    await session.query.setModel(modelId);
+    await this.updateConfigOption(params.sessionId, "model", modelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1162,14 +1170,11 @@ export class ClaudeAcpAgent implements Agent {
     } else if (params.configId === "model") {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
+    // Effort SDK sync is handled inside applyConfigOptionValue so that direct
+    // effort changes and effort changes induced by a model switch go through
+    // the same path.
 
-    this.syncSessionConfigState(session, params.configId, params.value);
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === params.configId && typeof o.currentValue === "string"
-        ? { ...o, currentValue: resolvedValue }
-        : o,
-    );
+    await this.applyConfigOptionValue(session, params.configId, resolvedValue);
 
     return { configOptions: session.configOptions };
   }
@@ -1401,11 +1406,7 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[sessionId];
     if (!session) return;
 
-    this.syncSessionConfigState(session, configId, value);
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-    );
+    await this.applyConfigOptionValue(session, configId, value);
 
     await this.client.sessionUpdate({
       sessionId,
@@ -1416,7 +1417,12 @@ export class ClaudeAcpAgent implements Agent {
     });
   }
 
-  private syncSessionConfigState(session: Session, configId: string, value: string): void {
+  private async applyConfigOptionValue(
+    session: Session,
+    configId: string,
+    value: string,
+  ): Promise<void> {
+    // Sync top-level session state
     if (configId === "mode") {
       session.modes = { ...session.modes, currentModeId: value };
     } else if (configId === "model") {
@@ -1428,6 +1434,39 @@ export class ClaudeAcpAgent implements Agent {
         session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
+    }
+
+    // Update configOptions
+    if (configId === "model") {
+      // Rebuild config options since effort levels depend on the selected model
+      const effortOpt = session.configOptions.find((o) => o.id === "effort");
+      const currentEffort =
+        typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+      session.configOptions = buildConfigOptions(
+        session.modes,
+        session.models,
+        session.modelInfos,
+        currentEffort,
+      );
+
+      // Sync effort with the SDK if it changed after the model switch
+      const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
+      const newEffort =
+        typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
+      if (newEffort !== currentEffort) {
+        await session.query.applyFlagSettings({
+          effortLevel: newEffort as Settings["effortLevel"],
+        });
+      }
+    } else {
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
+      if (configId === "effort") {
+        await session.query.applyFlagSettings({
+          effortLevel: value as Settings["effortLevel"],
+        });
+      }
     }
   }
 
@@ -1705,7 +1744,20 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
-    const configOptions = buildConfigOptions(modes, models);
+    const configOptions = buildConfigOptions(
+      modes,
+      models,
+      initializationResult.models,
+      settingsManager.getSettings().effortLevel,
+    );
+
+    // Apply the initial effort level to the SDK so it matches the UI default
+    const initialEffort = configOptions.find((o) => o.id === "effort");
+    if (initialEffort && typeof initialEffort.currentValue === "string") {
+      await q.applyFlagSettings({
+        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
+      });
+    }
 
     this.sessions[sessionId] = {
       query: q,
@@ -1722,6 +1774,7 @@ export class ClaudeAcpAgent implements Agent {
       },
       modes,
       models,
+      modelInfos: initializationResult.models,
       configOptions,
       promptRunning: false,
       pendingMessages: new Map(),
@@ -1817,8 +1870,10 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
+  modelInfos: ModelInfo[],
+  currentEffortLevel?: string,
 ): SessionConfigOption[] {
-  return [
+  const options: SessionConfigOption[] = [
     {
       id: "mode",
       name: "Mode",
@@ -1846,6 +1901,46 @@ function buildConfigOptions(
       })),
     },
   ];
+
+  // Add effort level option based on the currently selected model
+  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
+  const supportedLevels = currentModelInfo?.supportsEffort
+    ? (currentModelInfo.supportedEffortLevels ?? [])
+    : [];
+
+  if (supportedLevels.length > 0) {
+    const effortOptions = supportedLevels.map((level) => ({
+      value: level,
+      name: level
+        .split(/[_-]/)
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+        .join(" "),
+    }));
+
+    // Keep the current level if valid, otherwise prefer xhigh (Claude Code's
+    // recommended default for capable models), then high (the API default).
+    const includes = (l: string) => (supportedLevels as string[]).includes(l);
+    const validEffort =
+      currentEffortLevel && includes(currentEffortLevel)
+        ? currentEffortLevel
+        : includes("xhigh")
+          ? "xhigh"
+          : includes("high")
+            ? "high"
+            : supportedLevels[0];
+
+    options.push({
+      id: "effort",
+      name: "Effort",
+      description: "Available effort levels for this model",
+      category: "effort",
+      type: "select",
+      currentValue: validEffort,
+      options: effortOptions,
+    });
+  }
+
+  return options;
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,
