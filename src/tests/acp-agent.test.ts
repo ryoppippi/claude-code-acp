@@ -214,8 +214,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     const commands = await client.availableCommandsPromise;
 
     expect(commands).toContainEqual({
-      description:
-        "Clear conversation history but keep a summary in context. Optional: /compact [instructions for summarization]",
+      description: "Free up context by summarizing the conversation so far",
       input: {
         hint: "<optional custom summarization instructions>",
       },
@@ -1173,7 +1172,7 @@ describe("prompt conversion", () => {
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
   it("finds vendored cli path", async () => {
     const path = await claudeCliPath();
-    expect(path).toContain("@anthropic-ai/claude-agent-sdk/cli.js");
+    expect(path).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
   });
 
   it("query has a 'default' model", async () => {
