@@ -24,7 +24,15 @@ import {
   toolUpdateFromToolResult,
   toolUpdateFromEditToolResponse,
 } from "../tools.js";
-import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, claudeCliPath } from "../acp-agent.js";
+import {
+  toAcpNotifications,
+  promptToClaude,
+  isLocalCommandMetadata,
+  stripLocalCommandMetadata,
+  ClaudeAcpAgent,
+  claudeCliPath,
+  describeAlwaysAllow,
+} from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -1110,6 +1118,113 @@ describe("toolUpdateFromEditToolResponse", () => {
   });
 });
 
+describe("stripLocalCommandMetadata", () => {
+  it("returns null for strings that are pure marker metadata", () => {
+    expect(stripLocalCommandMetadata("<command-name>/model</command-name>")).toBeNull();
+    expect(
+      stripLocalCommandMetadata("<local-command-stdout>out</local-command-stdout>"),
+    ).toBeNull();
+    expect(
+      stripLocalCommandMetadata("<local-command-stderr>err</local-command-stderr>"),
+    ).toBeNull();
+    expect(
+      stripLocalCommandMetadata(
+        "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>",
+      ),
+    ).toBeNull();
+  });
+
+  it("returns the string unchanged for real content", () => {
+    expect(stripLocalCommandMetadata("hi")).toBe("hi");
+    expect(stripLocalCommandMetadata("please run /model with args")).toBe(
+      "please run /model with args",
+    );
+  });
+
+  // Regression: in the original bug report the entire /model preamble and
+  // the user's real "hi" prompt were concatenated into a single message.
+  // We want to strip the marker tags and preserve the real prose, not drop
+  // the whole message.
+  it("strips marker tags from mixed-content strings, preserving real prose", () => {
+    const mixed =
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>" +
+      "<local-command-stdout>Set model to opus (claude-opus-4-7)</local-command-stdout>" +
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus[1m]</command-args>" +
+      "<local-command-stdout>Set model to opus[1m] (claude-opus-4-7[1m])</local-command-stdout>" +
+      "hi";
+    const stripped = stripLocalCommandMetadata(mixed);
+    expect(typeof stripped).toBe("string");
+    expect(stripped as string).not.toContain("<command-name>");
+    expect(stripped as string).not.toContain("<command-message>");
+    expect(stripped as string).not.toContain("<command-args>");
+    expect(stripped as string).not.toContain("<local-command-stdout>");
+    expect((stripped as string).trimEnd()).toMatch(/hi$/);
+  });
+
+  it("drops marker-only blocks from mixed arrays, keeping real blocks", () => {
+    const result = stripLocalCommandMetadata([
+      { type: "text", text: "<command-name>/model</command-name>" },
+      { type: "text", text: "<local-command-stdout>ok</local-command-stdout>" },
+      { type: "text", text: "hi" },
+    ]);
+    expect(result).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  it("returns null when every block is a marker", () => {
+    expect(
+      stripLocalCommandMetadata([
+        { type: "text", text: "<command-name>/model</command-name>" },
+        { type: "text", text: "<local-command-stdout>ok</local-command-stdout>" },
+      ]),
+    ).toBeNull();
+  });
+
+  it("strips tags inside a text block while keeping the trailing prose", () => {
+    const result = stripLocalCommandMetadata([
+      {
+        type: "text",
+        text: "<command-name>/model</command-name><local-command-stdout>ok</local-command-stdout>hi",
+      },
+    ]);
+    expect(result).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  it("leaves non-text blocks alone", () => {
+    const image = { type: "image", source: { type: "base64", data: "", media_type: "image/png" } };
+    const result = stripLocalCommandMetadata([
+      { type: "text", text: "<command-name>/model</command-name>" },
+      image,
+    ]);
+    expect(result).toEqual([image]);
+  });
+
+  it("handles null/undefined/non-container shapes", () => {
+    expect(stripLocalCommandMetadata(null)).toBeNull();
+    expect(stripLocalCommandMetadata(undefined)).toBeUndefined();
+    expect(stripLocalCommandMetadata({ arbitrary: "object" })).toEqual({ arbitrary: "object" });
+  });
+});
+
+describe("isLocalCommandMetadata", () => {
+  it("is true when stripping leaves nothing", () => {
+    expect(isLocalCommandMetadata("<command-name>/model</command-name>")).toBe(true);
+    expect(
+      isLocalCommandMetadata([{ type: "text", text: "<command-name>/model</command-name>" }]),
+    ).toBe(true);
+  });
+
+  it("is false when real content survives stripping", () => {
+    expect(isLocalCommandMetadata("hi")).toBe(false);
+    expect(isLocalCommandMetadata("<command-name>/model</command-name>hi")).toBe(false);
+    expect(
+      isLocalCommandMetadata([
+        { type: "text", text: "<command-name>/model</command-name>" },
+        { type: "text", text: "hi" },
+      ]),
+    ).toBe(false);
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";
@@ -1253,6 +1368,81 @@ describe("permission requests", () => {
       expect(requestStructure.toolCall.content).toBeDefined();
       expect(Array.isArray(requestStructure.toolCall.content)).toBe(true);
     }
+  });
+
+  describe("describeAlwaysAllow", () => {
+    it("falls back to naming the whole tool when no suggestions are provided", () => {
+      expect(describeAlwaysAllow(undefined, "Bash")).toBe("Always Allow all Bash");
+      expect(describeAlwaysAllow([], "Read")).toBe("Always Allow all Read");
+    });
+
+    it("includes the scoped rule content from a suggestion", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow Bash(npm test:*)");
+    });
+
+    it("indicates a tool-wide rule when the suggestion has no ruleContent", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Read" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+        "Read",
+      );
+      expect(label).toBe("Always Allow all Read");
+    });
+
+    it("joins multiple rules and directory suggestions", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [
+              { toolName: "Bash", ruleContent: "git status" },
+              { toolName: "Bash", ruleContent: "git diff:*" },
+            ],
+            behavior: "allow",
+            destination: "session",
+          },
+          {
+            type: "addDirectories",
+            directories: ["/tmp/work"],
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow Bash(git status), Bash(git diff:*) and access to /tmp/work");
+    });
+
+    it("ignores non-allow rules and falls back when nothing is left", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash", ruleContent: "rm -rf:*" }],
+            behavior: "deny",
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow all Bash");
+    });
   });
 });
 
