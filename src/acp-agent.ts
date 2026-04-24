@@ -1588,6 +1588,9 @@ export class ClaudeAcpAgent implements Agent {
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
 
+    // Parse model configuration from environment (e.g. Bedrock model overrides)
+    const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
+
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
 
@@ -1606,6 +1609,17 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
+      // CLAUDE_MODEL_CONFIG env var is a fallback for model
+      // configuration (e.g. Bedrock model ID overrides). When the caller
+      // provides settings via _meta, we intentionally ignore the env var —
+      // the caller is assumed to have full control over model configuration.
+      ...(!userProvidedOptions?.settings &&
+        modelConfig && {
+          settings: {
+            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
+            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
+          },
+        }),
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
@@ -2528,6 +2542,20 @@ function commonPrefixLength(a: string, b: string) {
 function inferContextWindowFromModel(model: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
   return null;
+}
+
+function parseModelConfig(
+  raw: string | undefined,
+): { modelOverrides?: Record<string, string>; availableModels?: string[] } | undefined {
+  if (!raw) return undefined;
+  const parsed = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("CLAUDE_MODEL_CONFIG must be a JSON object");
+  }
+  const result: { modelOverrides?: Record<string, string>; availableModels?: string[] } = {};
+  if (parsed.modelOverrides !== undefined) result.modelOverrides = parsed.modelOverrides;
+  if (parsed.availableModels !== undefined) result.availableModels = parsed.availableModels;
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
