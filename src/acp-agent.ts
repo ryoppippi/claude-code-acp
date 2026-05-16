@@ -2164,7 +2164,7 @@ function createEnvForGateway(request?: GatewayAuthRequest) {
   if (request.methodId === "gateway-bedrock") {
     return {
       CLAUDE_CODE_USE_BEDROCK: "1",
-      AWS_BEARER_TOKEN_BEDROCK: "",
+      AWS_BEARER_TOKEN_BEDROCK: " ", // Must be non-empty to bypass pass configuration check
       ANTHROPIC_BEDROCK_BASE_URL: request._meta.gateway.baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     };
