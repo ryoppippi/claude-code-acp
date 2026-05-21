@@ -1822,7 +1822,7 @@ export class ClaudeAcpAgent implements Agent {
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
         await session.query.applyFlagSettings({
-          effortLevel: newEffort as Settings["effortLevel"],
+          effortLevel: toSdkEffortLevel(newEffort),
         });
       }
 
@@ -1847,7 +1847,7 @@ export class ClaudeAcpAgent implements Agent {
       );
       if (configId === "effort") {
         await session.query.applyFlagSettings({
-          effortLevel: value as Settings["effortLevel"],
+          effortLevel: toSdkEffortLevel(value),
         });
       }
     }
@@ -2223,7 +2223,11 @@ export class ClaudeAcpAgent implements Agent {
 
     // Apply the initial effort level to the SDK so it matches the UI default
     const initialEffort = configOptions.find((o) => o.id === "effort");
-    if (initialEffort && typeof initialEffort.currentValue === "string") {
+    if (
+      initialEffort &&
+      typeof initialEffort.currentValue === "string" &&
+      initialEffort.currentValue !== "default"
+    ) {
       await q.applyFlagSettings({
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
@@ -2419,6 +2423,16 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
   return modes;
 }
 
+// Translate a UI effort value into the flag-layer payload. The SDK
+// shallow-merges `applyFlagSettings`, drops `undefined` during JSON transport,
+// and only clears a key when an explicit `null` is sent — see
+// `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
+// `"default"` sentinel and `undefined` (effort option absent for the model) to
+// `null` ensures any previously-applied flag is actually cleared.
+function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | null {
+  return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
+}
+
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
@@ -2461,25 +2475,20 @@ function buildConfigOptions(
     : [];
 
   if (supportedLevels.length > 0) {
-    const effortOptions = supportedLevels.map((level) => ({
-      value: level,
-      name: level
-        .split(/[_-]/)
-        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-        .join(" "),
-    }));
+    const effortOptions = [
+      { value: "default", name: "Default" },
+      ...supportedLevels.map((level) => ({
+        value: level,
+        name: level
+          .split(/[_-]/)
+          .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+          .join(" "),
+      })),
+    ];
 
-    // Keep the current level if valid, otherwise prefer xhigh (Claude Code's
-    // recommended default for capable models), then high (the API default).
-    const includes = (l: string) => (supportedLevels as string[]).includes(l);
+    const includes = (l: string) => l === "default" || (supportedLevels as string[]).includes(l);
     const validEffort =
-      currentEffortLevel && includes(currentEffortLevel)
-        ? currentEffortLevel
-        : includes("xhigh")
-          ? "xhigh"
-          : includes("high")
-            ? "high"
-            : supportedLevels[0];
+      currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
 
     options.push({
       id: "effort",
