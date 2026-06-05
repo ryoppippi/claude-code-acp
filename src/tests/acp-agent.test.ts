@@ -3108,6 +3108,49 @@ describe("usage_update computation", () => {
     // size should be 1000000 (Opus), not 200000 (the fallback if <synthetic> overrode the model)
     expect(usageUpdate.update.size).toBe(1000000);
   });
+
+  it("compact_boundary uses authoritative getContextUsage for used, keeps session window for size", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    // A 1M window learned earlier (e.g. from modelUsage) must survive compaction
+    // — getContextUsage's window field under-reports it, so we don't use it.
+    session.contextWindowSize = 1000000;
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(12345);
+    // size stays at the session's learned window, NOT getContextUsage's value.
+    expect(usageUpdate.update.size).toBe(1000000);
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 200000;
+    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(0);
+    expect(usageUpdate.update.size).toBe(200000);
+    expect(session.contextWindowSize).toBe(200000);
+  });
 });
 
 describe("emitRawSDKMessages", () => {

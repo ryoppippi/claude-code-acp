@@ -62,6 +62,7 @@ import {
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
+  ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -941,28 +942,35 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "compact_boundary": {
-                // Send used:0 immediately so the client doesn't keep showing
-                // the stale pre-compaction context size until the next turn.
+                // Refresh the displayed usage immediately so the client doesn't
+                // keep showing the stale pre-compaction size (e.g. "944k/1m")
+                // right after the user sees "Compacting completed", which is
+                // confusing and wrong.
                 //
-                // This is a deliberate approximation: we don't know the exact
-                // post-compaction token count (only the SDK's next API call
-                // reveals that). But used:0 is directionally correct — context
-                // just dropped dramatically — and the real value replaces it
-                // within seconds when the next result message arrives.
-                // The alternative (no update) leaves the client showing e.g.
-                // "944k/1m" right after the user sees "Compacting completed",
-                // which is confusing and wrong.
+                // Prefer the SDK's authoritative post-compaction `used` via
+                // getContextUsage — it reflects the real retained context
+                // (system prompt + tools + surviving messages), which the
+                // per-message API usage numbers can't give us until the next
+                // turn's result. If the control request fails, fall back to the
+                // used:0 approximation: directionally correct (context just
+                // dropped dramatically) and replaced within seconds by the next
+                // result message.
+                //
+                // `size` keeps coming from session.contextWindowSize (learned
+                // from modelUsage / the model heuristic) — getContextUsage's
+                // window field under-reports extended 1M windows.
                 //
                 // The "Compacting completed." text is emitted from the `status`
                 // handler (keyed on `compact_result`), not here, so the failure
                 // path gets a message too.
-                lastAssistantTotalUsage = 0;
+                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
+                lastAssistantTotalUsage = usedTokens ?? 0;
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "usage_update",
-                    used: 0,
+                    used: lastAssistantTotalUsage,
                     size: session.contextWindowSize,
                   },
                 });
@@ -1043,6 +1051,49 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              case "mirror_error": {
+                // The SDK failed to persist session history (SessionStore
+                // append rejected/timed out after retry) — potential data loss
+                // the user should know about rather than a silent gap on
+                // resume. Log it and surface a warning in the conversation.
+                this.logger.error(
+                  `Session ${message.session_id}: failed to persist history: ${message.error}`,
+                );
+                break;
+              }
+              case "permission_denied": {
+                // A tool call was auto-denied (by a rule, the classifier,
+                // dontAsk mode, etc.) before running. The tool_use block was
+                // already emitted as a `tool_call`, so mark it failed with the
+                // rejection reason — otherwise the client shows a tool call
+                // that silently never resolves.
+                const reason = message.decision_reason ?? message.message;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: message.tool_use_id,
+                    status: "failed",
+                    content: [
+                      {
+                        type: "content",
+                        content: { type: "text", text: `Permission denied: ${reason}` },
+                      },
+                    ],
+                    _meta: {
+                      claudeCode: {
+                        toolName: message.tool_name,
+                        toolResponse: {
+                          decisionReasonType: message.decision_reason_type,
+                          decisionReason: message.decision_reason,
+                          message: message.message,
+                        },
+                      },
+                    } satisfies ToolUpdateMeta,
+                  },
+                });
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
@@ -1055,8 +1106,6 @@ export class ClaudeAcpAgent implements Agent {
               case "plugin_install":
               case "notification":
               case "api_retry":
-              case "mirror_error":
-              case "permission_denied":
               case "thinking_tokens":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
@@ -1412,11 +1461,40 @@ export class ClaudeAcpAgent implements Agent {
             }
             break;
           }
-          case "tool_progress":
+          case "tool_progress": {
+            await this.client.sessionUpdate({
+              sessionId: message.session_id,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: message.tool_use_id,
+                status: "in_progress",
+                _meta: {
+                  claudeCode: {
+                    toolName: message.tool_name,
+                    toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
+                  },
+                } satisfies ToolUpdateMeta,
+              },
+            });
+            break;
+          }
+          case "rate_limit_event": {
+            if (lastAssistantTotalUsage !== null) {
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: lastAssistantTotalUsage,
+                  size: session.contextWindowSize,
+                  _meta: { "_claude/rateLimit": message.rate_limit_info },
+                },
+              });
+            }
+            break;
+          }
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
-          case "rate_limit_event":
             break;
           default:
             unreachable(message);
@@ -2165,10 +2243,8 @@ export class ClaudeAcpAgent implements Agent {
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
-    // Configure thinking tokens from environment variable
-    const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
-      ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
-      : undefined;
+    // Configure thinking behavior from environment variable
+    const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
 
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
@@ -2194,7 +2270,7 @@ export class ClaudeAcpAgent implements Agent {
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
-      ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
+      ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
       // CLAUDE_MODEL_CONFIG env var is a fallback for model
       // configuration (e.g. Bedrock model ID overrides). When the caller
@@ -2422,7 +2498,6 @@ export class ClaudeAcpAgent implements Agent {
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
     }
-
     this.sessions[sessionId] = {
       query: q,
       input: input,
@@ -3439,13 +3514,53 @@ function commonPrefixLength(a: string, b: string) {
 }
 
 /** Best-effort first guess of a model's context window from its ID, used only
- *  until a `result` message arrives with the authoritative `modelUsage` value.
+ *  as a fallback when the SDK's authoritative `getContextUsage` is unavailable
+ *  (and until a `result` message arrives with the `modelUsage` value).
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
  *  matching things like "10m" or embedded substrings. */
 function inferContextWindowFromModel(model: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
   return null;
+}
+
+/** Fetch the SDK's authoritative context-window occupancy via the
+ *  `getContextUsage` control request. Unlike the per-message API usage numbers
+ *  (which only count message tokens), this `totalTokens` includes the system
+ *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
+ *  occupancy the user sees. Returns `null` on any control-request failure.
+ *
+ *  Note: we deliberately do NOT use this response's window fields for `size`.
+ *  They have been observed to under-report extended (1M) context windows, so
+ *  the window keeps coming from `modelUsage` / `inferContextWindowFromModel`,
+ *  which handle the 1M variants correctly. */
+async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
+  try {
+    const usage = await query.getContextUsage();
+    return usage.totalTokens;
+  } catch (error) {
+    logger.error("Failed to fetch context usage from SDK:", error);
+    return null;
+  }
+}
+
+/** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
+ *  option. The `maxThinkingTokens` option it used to feed is deprecated and
+ *  reduced to on/off on current models, so map the value to explicit thinking
+ *  config instead: unset → `undefined` (SDK default, adaptive on models that
+ *  support it); `0` → disabled; a positive integer → a fixed token budget.
+ *  Anything else is ignored with a warning. */
+function resolveThinkingConfig(
+  raw: string | undefined,
+  logger: Logger,
+): ThinkingConfig | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    logger.error(`Ignoring MAX_THINKING_TOKENS: expected a non-negative integer, got '${raw}'.`);
+    return undefined;
+  }
+  return parsed === 0 ? { type: "disabled" } : { type: "enabled", budgetTokens: parsed };
 }
 
 function parseModelConfig(
