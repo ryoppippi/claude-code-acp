@@ -17,6 +17,7 @@ import {
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  LogoutRequest,
   methods,
   ndJsonStream,
   NewSessionRequest,
@@ -74,11 +75,13 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
 import {
   applyAskElicitationResponse,
@@ -108,6 +111,8 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+
+const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -855,6 +860,9 @@ export class ClaudeAcpAgent {
           http: true,
           sse: true,
         },
+        auth: {
+          logout: {},
+        },
         loadSession: true,
         sessionCapabilities: {
           additionalDirectories: {},
@@ -990,6 +998,30 @@ export class ClaudeAcpAgent {
       return;
     }
     throw new Error("Method not implemented.");
+  }
+
+  async logout(_params: LogoutRequest): Promise<void> {
+    // Clear in-memory gateway credentials supplied via `authenticate`. The
+    // gateway method never touches the on-disk credential store, so dropping
+    // this reference is the whole logout for that path.
+    this.gatewayAuthRequest = undefined;
+
+    // For the Claude/Console login methods the credentials live in the native
+    // CLI's store (keychain or config dir), which only the binary can clear.
+    // `claude auth logout` is non-interactive and idempotent.
+    const cliPath = await claudeCliPath();
+    try {
+      await execFileAsync(cliPath, ["auth", "logout"]);
+    } catch (error) {
+      const stderr =
+        typeof error === "object" && error && "stderr" in error
+          ? String((error as { stderr: unknown }).stderr).trim()
+          : undefined;
+      throw RequestError.internalError(
+        { stderr: stderr || undefined },
+        `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -4572,6 +4604,7 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
