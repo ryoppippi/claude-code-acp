@@ -447,8 +447,7 @@ function isMuslLibc(): boolean {
   // process.report.getReport().header.glibcVersionRuntime is populated when
   // Node is dynamically linked against glibc, and absent on musl.
   const report = process.report?.getReport() as
-    | { header?: { glibcVersionRuntime?: string } }
-    | undefined;
+    { header?: { glibcVersionRuntime?: string } } | undefined;
   return !report?.header?.glibcVersionRuntime;
 }
 
@@ -1598,6 +1597,7 @@ export class ClaudeAcpAgent {
               case "api_retry":
               case "thinking_tokens":
               case "model_refusal_fallback":
+              case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
