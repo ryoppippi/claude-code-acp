@@ -12,11 +12,12 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
   );
+  const { makeMockQuery, DEFAULT_CONTEXT_USAGE } = await import("./helpers.js");
   return {
     ...actual,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
-      return {
+      return makeMockQuery({
         initializationResult: async () => ({
           models: [
             {
@@ -27,15 +28,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
             },
           ],
         }),
-        setModel: async () => {},
-        setPermissionMode: async () => {},
-        supportedCommands: async () => [],
         getContextUsage: () =>
-          contextUsageResult
-            ? contextUsageResult()
-            : Promise.reject(new Error("no context usage mocked")),
-        [Symbol.asyncIterator]: async function* () {},
-      };
+          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+      });
     },
   };
 });
@@ -520,8 +515,13 @@ describe("createSession options merging", () => {
 
     it("ignores a non-numeric value", async () => {
       process.env.MAX_THINKING_TOKENS = "lots";
+      // The bad value is deliberate — capture the agent's warning instead of
+      // letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
       expect(capturedOptions!.thinking).toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("MAX_THINKING_TOKENS"));
     });
 
     it("lets a user-provided thinking option override the env default", async () => {
@@ -637,11 +637,18 @@ describe("createSession options merging", () => {
     });
 
     it("falls back to the default window when getContextUsage fails and inference misses", async () => {
-      // The default mock rejects getContextUsage, and the mock model
-      // ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") has no "1m" hint.
+      // getContextUsage rejects, and the mock model ("claude-sonnet-4-6" /
+      // "Claude Sonnet" / "Fast") has no "1m" hint.
+      contextUsageResult = () => Promise.reject(new Error("no context usage mocked"));
+      // The rejection is deliberate — capture the agent's warning instead of
+      // letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
+
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(errorSpy).toHaveBeenCalled();
     });
 
     it("ignores a nonsensical (non-positive) reported window", async () => {
@@ -750,6 +757,10 @@ describe("createSession options merging", () => {
 
     it("cancels on a malformed payload without presenting anything", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
+      // The malformed payload is deliberate — capture the agent's warning
+      // instead of letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       const result = await onUserDialog(
         { dialogKind: "refusal_fallback_prompt", payload: { fallbackModel: 42 } },
@@ -758,11 +769,16 @@ describe("createSession options merging", () => {
 
       expect(result).toEqual({ behavior: "cancelled" });
       expect(createElicitation).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("unexpected shape"));
     });
 
     it("cancels when the elicitation request fails", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
       createElicitation.mockRejectedValue(new Error("client exploded"));
+      // The client failure is deliberate — capture the agent's warning
+      // instead of letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       const result = await onUserDialog(
         {
@@ -773,6 +789,7 @@ describe("createSession options merging", () => {
       );
 
       expect(result).toEqual({ behavior: "cancelled" });
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("client exploded"));
     });
   });
 });

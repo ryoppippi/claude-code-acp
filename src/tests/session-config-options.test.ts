@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { makeMockQuery } from "./helpers.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -101,12 +102,11 @@ describe("session config options", () => {
     applyFlagSettingsSpy = vi.fn();
 
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
-      query: {
+      query: makeMockQuery({
         setPermissionMode: setPermissionModeSpy,
         setModel: setModelSpy,
         applyFlagSettings: applyFlagSettingsSpy,
-        supportedCommands: async () => [],
-      },
+      }),
       input: null,
       cancelled: false,
       permissionMode: "default",
@@ -956,6 +956,10 @@ describe("session config options", () => {
       session.modelInfos = session.modelInfos.map((m: ModelInfo) =>
         m.value === "claude-sonnet-4-6" ? { ...m, resolvedModel: "claude-sonnet-5[1m]" } : m,
       );
+      // The rejection is deliberate — capture the agent's warning instead of
+      // letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -964,12 +968,17 @@ describe("session config options", () => {
       });
 
       expect(session.contextWindowSize).toBe(1_000_000);
+      expect(errorSpy).toHaveBeenCalled();
     });
 
     it("falls back to the default window when the SDK and inference both miss", async () => {
       const session = getSession();
       session.contextWindowSize = 1_000_000;
       session.query.getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+      // The rejection is deliberate — capture the agent's warning instead of
+      // letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -978,6 +987,7 @@ describe("session config options", () => {
       });
 
       expect(session.contextWindowSize).toBe(200000);
+      expect(errorSpy).toHaveBeenCalled();
     });
 
     it("keeps the learned window when re-asserting the current model", async () => {
