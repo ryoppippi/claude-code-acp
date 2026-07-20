@@ -515,9 +515,42 @@ function structuredResult<T extends object>(toolUseResult: unknown): T | undefin
  * matching rather than mangle the report.
  */
 function stripAgentTrailer(text: string): string {
-  return text
-    .replace(/\n?<usage>[\s\S]*?<\/usage>\s*$/, "")
-    .replace(/\n?agentId: [\w-]+ \([^)]*\)\s*$/, "");
+  return stripAgentIdLine(stripUsageBlock(text));
+}
+
+const USAGE_OPEN = "<usage>";
+const USAGE_CLOSE = "</usage>";
+
+/** Remove a trailing `<usage>…</usage>` block, plus trailing whitespace and
+ *  one preceding newline. Matches from the *last* `<usage>` so a report that
+ *  merely mentions the marker earlier isn't truncated at the mention. */
+function stripUsageBlock(text: string): string {
+  const body = text.trimEnd();
+  if (!body.endsWith(USAGE_CLOSE)) {
+    return text;
+  }
+  const open = body.lastIndexOf(USAGE_OPEN, body.length - USAGE_CLOSE.length - USAGE_OPEN.length);
+  if (open === -1) {
+    return text;
+  }
+  return body.slice(0, open > 0 && body[open - 1] === "\n" ? open - 1 : open);
+}
+
+/** The continuation line, anchored to a whole line so the regex has a single
+ *  start position and no ambiguous repetition (`[\w-]+` can't consume the
+ *  following space, `[^)]*` can't consume the closing paren) — it runs in
+ *  linear time on any input. */
+const AGENT_ID_LINE = /^agentId: [\w-]+ \([^)]*\)$/;
+
+/** Remove a final `agentId: <id> (…)` line, plus trailing whitespace and the
+ *  newline that preceded the line. */
+function stripAgentIdLine(text: string): string {
+  const body = text.trimEnd();
+  const lineStart = body.lastIndexOf("\n") + 1;
+  if (!AGENT_ID_LINE.test(body.slice(lineStart))) {
+    return text;
+  }
+  return body.slice(0, Math.max(lineStart - 1, 0));
 }
 
 /** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain
