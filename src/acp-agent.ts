@@ -3762,11 +3762,30 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
+            // Not every beat reports under the id of a tool call the client has
+            // seen: heartbeats derive `<tool_use_id>-heartbeat-<n>`, and the
+            // `agent_api_retry` beats behind `subagentRetry` report under
+            // `agent_<assistant_message_id>`. Forwarding those verbatim leaves the
+            // client resolving an id it has never been told about (the same trap
+            // `ensureToolCallEmitted` documents for #851). The SDK stamps
+            // `parent_tool_use_id` with the executing tool's real id whenever the
+            // beat doesn't carry one of its own, so fall back to it rather than
+            // pattern-matching each synthetic id shape. Beats that do report a real
+            // id (a subagent's `bash_progress`, whose parent is the spawning Agent
+            // call) keep resolving to that id.
+            const toolCallId = session.emittedToolCalls.has(message.tool_use_id)
+              ? message.tool_use_id
+              : message.parent_tool_use_id;
+            // Ids leave `emittedToolCalls` at `tool_result`, so this also stops a
+            // beat that races past completion from reopening a finished call.
+            if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
+              break;
+            }
             await sendUpdate({
               sessionId: message.session_id,
               update: {
                 sessionUpdate: "tool_call_update",
-                toolCallId: message.tool_use_id,
+                toolCallId,
                 status: "in_progress",
                 _meta: {
                   claudeCode: {
