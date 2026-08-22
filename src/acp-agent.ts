@@ -27,7 +27,6 @@ import {
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
-  PermissionOption,
   PromptRequest,
   PromptResponse,
   ProviderInfo,
@@ -72,7 +71,6 @@ import {
   Options,
   PermissionMode,
   PermissionResult,
-  PermissionUpdate,
   Query,
   query,
   SDKAssistantMessageError,
@@ -120,6 +118,11 @@ import {
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
+import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
+import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
+import { buildClaudePermissionOptions } from "./permissions/options.js";
+import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
+import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
 import {
   activeUsageLimitMessage,
@@ -169,6 +172,17 @@ import {
   toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import {
+  acceptedPlanToolResult,
+  ExitPlanCoordinator,
+  executionDiagnostic,
+  exitPlanModeRawOutput,
+  observeExitPlanToolResults,
+} from "./exit-plan.js";
+import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+import { parseToolResultMeta } from "./tool-result-meta.js";
+
+export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -419,6 +433,7 @@ type Turn = {
   /** What a steered turn settles with once its steered work has run: the outcome
    *  of its latest result, so its usage covers every cycle the turn ran. */
   steeredSettle?: PromptResponse;
+  carriedUsage?: AccumulatedUsage;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
   /** Settles after the ACP prompt request completes, regardless of outcome. */
@@ -576,6 +591,7 @@ export type Session = {
    *  fresh session it stalls until the first turn runs (see the seeding call
    *  sites and `contextWindowCache`). */
   contextWindowSize: number;
+  contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
    *  cross-session cache, a resumed session's `getContextUsage` report, or a
    *  `result.modelUsage`) rather than the text heuristic / default. Guards the
@@ -610,6 +626,17 @@ export type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** ExitPlanMode denial that intentionally interrupts the current Claude
+   *  cycle. Correlated by tool-use id until the terminal result arrives. */
+  pendingExitPlanModeInterruption?: {
+    toolUseId: string;
+    toolResultSeen: boolean;
+  };
+  pendingExitPlanContextReset?: {
+    toolUseId: string;
+    plan: string;
+    mode: PermissionMode;
+  };
   /** Registry of live background tasks, keyed by task id: populated at
    *  `task_started`, pruned when the task settles (a `task_notification` or
    *  a terminal `task_updated` patch), and reconciled against
@@ -1118,10 +1145,6 @@ function shouldHideClaudeAuth(): boolean {
  *  revivable, so the only recovery is a fresh session. */
 const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start a new session.";
 
-// Bypass Permissions doesn't work if we are a root/sudo user
-const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
-const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
-
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
@@ -1240,172 +1263,6 @@ export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
   );
 }
 
-const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
-  auto: "auto",
-  default: "default",
-  // Claude Code 2.1.200 renamed the "default" mode to "Manual" and accepts
-  // `"defaultMode": "manual"` in settings.json; honor the same alias here.
-  manual: "default",
-  acceptedits: "acceptEdits",
-  dontask: "dontAsk",
-  plan: "plan",
-  bypasspermissions: "bypassPermissions",
-  bypass: "bypassPermissions",
-};
-
-export function resolvePermissionMode(
-  defaultMode?: unknown,
-  logger: Logger = console,
-): PermissionMode {
-  if (defaultMode === undefined) {
-    return "default";
-  }
-
-  if (typeof defaultMode !== "string") {
-    logger.error("Ignoring permissions.defaultMode from settings: expected a string.");
-    return "default";
-  }
-
-  const normalized = defaultMode.trim().toLowerCase();
-  if (normalized === "") {
-    logger.error("Ignoring permissions.defaultMode from settings: expected a non-empty string.");
-    return "default";
-  }
-
-  const mapped = PERMISSION_MODE_ALIASES[normalized];
-  if (!mapped) {
-    logger.error(`Ignoring permissions.defaultMode from settings: unknown value '${defaultMode}'.`);
-    return "default";
-  }
-
-  if (mapped === "bypassPermissions" && !ALLOW_BYPASS) {
-    logger.error(
-      "Ignoring permissions.defaultMode from settings: bypassPermissions is not available when running as root.",
-    );
-    return "default";
-  }
-
-  return mapped;
-}
-
-function permissionLifetime(destination: PermissionUpdate["destination"]): Record<string, string> {
-  switch (destination) {
-    case "session":
-      return { scope: "session" };
-    case "cliArg":
-      return { scope: "process", storage: "cli_argument" };
-    case "userSettings":
-      return { scope: "persistent", storage: "user" };
-    case "projectSettings":
-      return { scope: "persistent", storage: "project" };
-    case "localSettings":
-      return { scope: "persistent", storage: "project_local" };
-    default:
-      return { scope: "unknown" };
-  }
-}
-
-function permissionMetadataForAlwaysAllow(
-  suggestions: PermissionUpdate[] | undefined,
-  toolName: string,
-): Record<string, unknown> {
-  const effectiveSuggestions =
-    suggestions && suggestions.length > 0
-      ? suggestions
-      : [
-          {
-            type: "addRules" as const,
-            rules: [{ toolName }],
-            behavior: "allow" as const,
-            destination: "session" as const,
-          },
-        ];
-  const changes: Array<Record<string, unknown>> = [];
-
-  for (const update of effectiveSuggestions) {
-    switch (update.type) {
-      case "addRules":
-      case "removeRules":
-      case "replaceRules": {
-        const operation =
-          update.type === "addRules" ? "add" : update.type === "removeRules" ? "remove" : "replace";
-        const targets = update.rules.map((rule) => ({
-          type: "tool",
-          toolName: rule.toolName,
-          ...(rule.ruleContent
-            ? {
-                matcher: {
-                  type: "provider_rule",
-                  provider: "claudeCode",
-                  value: rule.ruleContent,
-                },
-              }
-            : {}),
-        }));
-        const renderedRules = update.rules
-          .map((rule) =>
-            rule.ruleContent
-              ? `${rule.toolName} calls matching ${rule.ruleContent}`
-              : `all ${rule.toolName} calls`,
-          )
-          .join(", ");
-        const verb =
-          operation === "add"
-            ? update.behavior === "allow"
-              ? "Allow"
-              : update.behavior === "deny"
-                ? "Deny"
-                : "Ask before"
-            : operation === "remove"
-              ? `Remove ${update.behavior} rules for`
-              : `Replace ${update.behavior} rules with`;
-        changes.push({
-          type: "policy_rule",
-          operation,
-          ruleBehavior: update.behavior,
-          description: `${verb} ${renderedRules}`,
-          lifetime: permissionLifetime(update.destination),
-          targets,
-        });
-        break;
-      }
-      case "addDirectories":
-      case "removeDirectories": {
-        const operation = update.type === "addDirectories" ? "add" : "remove";
-        changes.push({
-          type: "policy_rule",
-          operation,
-          ruleBehavior: "allow",
-          description:
-            operation === "add"
-              ? `Allow filesystem access under ${update.directories.join(", ")}`
-              : `Remove additional filesystem access under ${update.directories.join(", ")}`,
-          lifetime: permissionLifetime(update.destination),
-          targets: update.directories.map((path) => ({
-            type: "filesystem",
-            matcher: { type: "directory", path },
-          })),
-        });
-        break;
-      }
-      case "setMode":
-        changes.push({
-          type: "permission_mode",
-          operation: "set",
-          provider: "claudeCode",
-          mode: update.mode,
-          description: `Set Claude Code permission mode to ${update.mode}`,
-          lifetime: permissionLifetime(update.destination),
-        });
-        break;
-      default:
-        break;
-    }
-  }
-
-  return { version: 1, changes };
-}
-
 /**
  * Client-facing surface the agent calls back into. This is the subset of ACP
  * client methods the agent actually uses, expressed as a narrow interface so
@@ -1482,6 +1339,30 @@ class ClientConnection implements AcpClient {
   }
 }
 
+function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("Tool use aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+    void operation.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -1494,6 +1375,7 @@ export class ClaudeAcpAgent {
   providerConfig?: ProviderConfig;
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
+  private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1503,6 +1385,39 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+    this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
+      currentSession: (id) => this.sessions[id],
+      closeQueryStream: (session) => this.closeQueryStream(session),
+      restartSession: async (params, options) => {
+        await this.createSession(params, options);
+        const session = this.sessions[options.publicSessionId];
+        if (!session) throw new Error("Fresh Claude context was not created");
+        return session;
+      },
+      applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
+      sessionUpdate: (notification) => this.client.sessionUpdate(notification),
+      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
+      logError: (message, error) => this.logger.error(message, error),
+      destroyReplacement: (id, session) => {
+        disarmForceCancel(session);
+        session.cancelController?.abort();
+        this.closeQueryStream(session);
+        session.abortController.abort();
+        if (this.sessions[id] === session) delete this.sessions[id];
+      },
+      settleCancelledTurn: (original, session, turn) => {
+        disarmForceCancel(session);
+        this.finishFileChangeAudit(session, turn, "cancelled");
+        turn.settled = true;
+        turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
+      },
+      settleFailedTurn: (session, turn, error) => {
+        disarmForceCancel(session);
+        this.finishFileChangeAudit(session, turn, "providerError");
+        turn.settled = true;
+        turn.reject(error);
+      },
+    });
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -2341,12 +2256,13 @@ export class ClaudeAcpAgent {
       // cleared when each consolidated message consumes it. #785 stopped
       // resetting the streamed-content tracking here but left this line.
       stopReason = "end_turn";
-      session.accumulatedUsage = {
+      session.accumulatedUsage = session.activeTurn?.carriedUsage ?? {
         inputTokens: 0,
         outputTokens: 0,
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       };
+      if (session.activeTurn) session.activeTurn.carriedUsage = undefined;
     };
 
     /** Promote a queued turn to active: it becomes the one output is attributed
@@ -3076,6 +2992,7 @@ export class ClaudeAcpAgent {
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usedTokens ?? 0;
+                session.contextUsedTokens = usedTokens ?? 0;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -3611,7 +3528,8 @@ export class ClaudeAcpAgent {
             // slash-command output forwarding), though their cost is real.
             const isAutonomousResult =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
-
+            const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
+            const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
               // Reconcile the Fast mode toggle with the SDK's reported state.
               // Gated to user-driven turns like every other side effect below;
@@ -3787,6 +3705,8 @@ export class ClaudeAcpAgent {
               }
 
               if (session.cancelled) {
+                session.pendingExitPlanModeInterruption = undefined;
+                session.pendingExitPlanContextReset = undefined;
                 if (!isAutonomousResult) {
                   await clearFailuresFromEarlierTurns();
                   stopReason = "cancelled";
@@ -3827,6 +3747,45 @@ export class ClaudeAcpAgent {
               }
 
               await clearFailuresFromEarlierTurns();
+
+              // `interrupt: true` is required to make "No, keep planning"
+              // terminate the ACP turn. Claude represents that intentional
+              // interrupt as an error-shaped diagnostic, so translate only a
+              // diagnostic causally paired with the recorded ExitPlanMode
+              // permission response.
+              const diagnostic = executionDiagnostic(message);
+              if (
+                pendingExitPlanModeInterruption &&
+                pendingExitPlanModeInterruption.toolResultSeen &&
+                message.is_error &&
+                diagnostic &&
+                /(?:^|\s)result_type=user(?:\s|$)/.test(diagnostic) &&
+                /(?:^|\s)stop_reason=tool_use(?:\s|$)/.test(diagnostic)
+              ) {
+                session.pendingExitPlanModeInterruption = undefined;
+                if (
+                  pendingExitPlanContextReset &&
+                  pendingExitPlanContextReset.toolUseId ===
+                    pendingExitPlanModeInterruption.toolUseId
+                ) {
+                  await this.exitPlan.restart(
+                    params.sessionId,
+                    session,
+                    pendingExitPlanContextReset,
+                  );
+                  return;
+                }
+                stopReason = "cancelled";
+                settleOrDefer({ stopReason: "cancelled", usage: sessionUsage(session) });
+                break;
+              }
+              if (pendingExitPlanModeInterruption) {
+                // This result ended the interrupted cycle without the exact
+                // correlated cancellation shape. Never carry its marker into
+                // a later turn, whether or not the tool result was observed.
+                session.pendingExitPlanModeInterruption = undefined;
+                session.pendingExitPlanContextReset = undefined;
+              }
 
               // A refusal can arrive on any result subtype (and may even set
               // is_error), so handle it before the subtype switch — otherwise the
@@ -4136,6 +4095,7 @@ export class ClaudeAcpAgent {
               const nextUsage = totalTokens(lastAssistantUsage);
               if (nextUsage !== lastAssistantTotalUsage) {
                 lastAssistantTotalUsage = nextUsage;
+                session.contextUsedTokens = nextUsage;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
@@ -4281,6 +4241,7 @@ export class ClaudeAcpAgent {
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
               lastAssistantUsage = snapshotFromUsage(message.message.usage);
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
+              session.contextUsedTokens = lastAssistantTotalUsage;
               lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.error || lastAssistantWasUsageLimit) {
                 lastAssistantFailureTitle = assistantMessageText(message.message);
@@ -4459,6 +4420,8 @@ export class ClaudeAcpAgent {
               content = message.message.content;
             }
 
+            const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
+
             for (const notification of toAcpNotifications(
               content,
               message.message.role,
@@ -4486,7 +4449,7 @@ export class ClaudeAcpAgent {
               // filtered out of `content` above; blocks that do pass through
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
-              await sendUpdate(notification);
+              await sendUpdate(acceptedPlanToolResult(notification, acceptedPlanToolUseId));
             }
             break;
           }
@@ -4664,10 +4627,14 @@ export class ClaudeAcpAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
+    this.exitPlan.cancel(params.sessionId);
     const session = this.sessions[params.sessionId];
     if (!session) {
       return;
     }
+    session.cancelled = true;
+    session.pendingExitPlanModeInterruption = undefined;
+    session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was
     // settled when it closed, and there is no live query to interrupt. Calling
     // query.interrupt() on a finished iterator could reject and surface from
@@ -4675,7 +4642,6 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       return;
     }
-    session.cancelled = true;
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
@@ -5309,16 +5275,16 @@ export class ClaudeAcpAgent {
   /** Forward a permission request to the client, wiring the tool call's
    *  `signal` through as a `cancellationSignal`. When the turn is cancelled
    *  while the client's prompt is still open the signal aborts, the SDK sends
-   *  `$/cancel_request`, and the client settles the request (a `cancelled`
-   *  outcome or a `requestCancelled` rejection). Either way we surface the same
-   *  "Tool use aborted" the callers already expect, so a cancelled dialog no
-   *  longer leaves the `await` hanging. */
+   *  `$/cancel_request`, and our local abort race settles even if the client
+   *  ignores it. A `cancelled` outcome, request rejection, and local abort all
+   *  surface the same "Tool use aborted" the callers already expect. */
   private async requestPermissionFromClient(
     params: RequestPermissionRequest,
     toolName: string,
     signal: AbortSignal,
     parentToolUseId?: string,
   ): Promise<RequestPermissionResponse> {
+    if (signal.aborted) throw new Error("Tool use aborted");
     // The SDK may invoke `canUseTool` (and therefore this permission request)
     // before the assistant message's tool_use block streams to us. Some ACP clients
     // expect the `tool_call` a permission request references to already exist,
@@ -5331,9 +5297,15 @@ export class ClaudeAcpAgent {
       params.toolCall.toolCallId,
       params.toolCall.rawInput,
       parentToolUseId,
+      signal,
     );
+    if (signal.aborted) throw new Error("Tool use aborted");
+
+    // Do not rely on every ACP client settling requestPermission after the
+    // cancellation signal. The local race guarantees that Claude's tool call
+    // is released even when an older or broken client ignores $/cancel_request.
     try {
-      return await this.client.requestPermission(params, signal);
+      return await raceWithAbort(this.client.requestPermission(params, signal), signal);
     } catch (error) {
       if (signal.aborted) {
         throw new Error("Tool use aborted", { cause: error });
@@ -5360,6 +5332,7 @@ export class ClaudeAcpAgent {
     toolCallId: string,
     toolInput: unknown,
     parentToolUseId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
@@ -5385,14 +5358,34 @@ export class ClaudeAcpAgent {
         },
       };
     }
-    await this.client.sessionUpdate({ sessionId, update });
+    try {
+      const emission = this.client.sessionUpdate({ sessionId, update });
+      await (signal ? raceWithAbort(emission, signal) : emission);
+    } catch (error) {
+      // The set is also the de-duplication guard for the later streamed
+      // tool_use. Keep it truthful: if emission failed, that path must still
+      // be allowed to publish the tool call instead of refining a phantom one.
+      session.emittedToolCalls.delete(toolCallId);
+      throw error;
+    }
   }
 
   canUseTool(sessionId: string): CanUseTool {
     return async (
       toolName,
       toolInput,
-      { signal, suggestions, toolUseID, agentID, matchedAskRule },
+      {
+        signal,
+        suggestions,
+        toolUseID,
+        agentID,
+        matchedAskRule,
+        blockedPath,
+        decisionReason,
+        title,
+        displayName,
+        description,
+      },
     ) => {
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
@@ -5457,181 +5450,101 @@ export class ClaudeAcpAgent {
           toolUseID,
           toolInput,
           parentToolUseId,
+          signal,
         );
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }
 
-      if (toolName === "ExitPlanMode") {
-        const optionsAll: PermissionOption[] = [
-          { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
-          {
-            kind: "allow_always",
-            name: "Yes, and auto-accept edits",
-            optionId: "acceptEdits",
-          },
-          { kind: "allow_once", name: "Yes, and manually approve edits", optionId: "default" },
-          { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
-        ];
-        if (ALLOW_BYPASS) {
-          optionsAll.unshift({
-            kind: "allow_always",
-            name: "Yes, and bypass permissions",
-            optionId: "bypassPermissions",
-          });
-        }
-        // Filter against the session's currently-advertised modes so we never
-        // present options the active model can't honor (e.g. `auto` on Haiku).
-        // `bypassPermissions` is already covered by `availableModes` via
-        // `buildAvailableModes`/`ALLOW_BYPASS`. The `plan` option is a
-        // "keep planning" reject path; it's always present in `availableModes`.
-        const options = optionsAll.filter((o) =>
-          session.modes.availableModes.some((m) => m.id === o.optionId),
-        );
+      // Do not auto-allow here based on the session's advertised mode. Claude
+      // Code applies bypassPermissions before invoking canUseTool; a request
+      // that still reaches this callback is deliberately bypass-immune (for
+      // example a safety check, a tool requiring user interaction, or an
+      // explicit ask rule). Re-applying bypass in the host would erase that
+      // provider safety decision.
 
-        const response = await this.requestPermissionFromClient(
-          {
-            options,
-            sessionId,
-            toolCall: {
-              toolCallId: toolUseID,
-              rawInput: toolInput,
-              ...toolInfoFromToolUse(
-                { name: toolName, input: toolInput, id: toolUseID },
-                supportsTerminalOutput,
-                session?.cwd,
-              ),
-              // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-              // so clients can rely on one shape everywhere.
-              ...(parentToolUseId
-                ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-                : {}),
-            },
-          },
-          toolName,
-          signal,
-          parentToolUseId,
-        );
+      const durableChangeSet = normalizeDurablePermissionChangeSet(
+        suggestions,
+        matchedAskRule !== undefined,
+      );
+      const presentation = buildClaudePermissionPresentation({
+        toolName,
+        input: toolInput,
+        toolUseID,
+        cwd: session.cwd,
+        supportsTerminalOutput,
+        blockedPath,
+        title,
+        displayName,
+        description,
+        decisionReason,
+      });
 
-        if (signal.aborted || response.outcome?.outcome === "cancelled") {
-          throw new Error("Tool use aborted");
-        }
-        const selectedMode =
-          response.outcome?.outcome === "selected" ? response.outcome.optionId : undefined;
-        const selectedModeWasOffered = options.some((option) => option.optionId === selectedMode);
-        if (
-          selectedModeWasOffered &&
-          (selectedMode === "default" ||
-            selectedMode === "acceptEdits" ||
-            selectedMode === "auto" ||
-            selectedMode === "bypassPermissions")
-        ) {
-          await this.client.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "current_mode_update",
-              currentModeId: selectedMode,
-            },
-          });
-          await this.updateConfigOption(sessionId, MODE_CONFIG_ID, selectedMode);
-
-          return {
-            behavior: "allow",
-            updatedInput: toolInput,
-            updatedPermissions: suggestions ?? [
-              { type: "setMode", mode: selectedMode, destination: "session" },
-            ],
-          };
-        } else {
-          return {
-            behavior: "deny",
-            message: "User rejected request to exit plan mode.",
-          };
-        }
-      }
-
-      // In bypass mode the CLI skips permission checks itself; the asks that
-      // still reach canUseTool are the ones it insists on prompting for even
-      // under --dangerously-skip-permissions. Keep auto-allowing those —
-      // bypass means bypass — EXCEPT rule-forced asks (`matchedAskRule`): the
-      // user explicitly configured a permissions.ask rule for this tool, and
-      // the SDK's guidance is that hosts running auto-approval must treat such
-      // asks as a human prompt. Fall through to the normal request below.
-      if (session.modes.currentModeId === "bypassPermissions" && !matchedAskRule) {
-        return {
-          behavior: "allow",
-          updatedInput: toolInput,
-          updatedPermissions: suggestions ?? [
-            { type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" },
-          ],
+      if (parentToolUseId) {
+        presentation.toolCall._meta = {
+          claudeCode: { toolName, parentToolUseId },
         };
       }
 
+      const permissionOptions = buildClaudePermissionOptions({
+        toolName,
+        displayName,
+        input: toolInput,
+        cwd: session.cwd,
+        durableChangeSet,
+        allowPersistentOptions: matchedAskRule === undefined,
+        availableModes: session.modes.availableModes.map((mode) => mode.id),
+        contextUsedPercent:
+          session.contextUsedTokens === undefined || session.contextWindowSize <= 0
+            ? undefined
+            : Math.max(
+                0,
+                Math.min(
+                  100,
+                  Math.round((session.contextUsedTokens / session.contextWindowSize) * 100),
+                ),
+              ),
+      });
+
       const response = await this.requestPermissionFromClient(
         {
-          options: [
-            { kind: "reject_once", name: "Deny", optionId: "reject" },
-            { kind: "allow_once", name: "Allow Once", optionId: "allow" },
-            {
-              kind: "allow_always",
-              name: "Always Allow",
-              optionId: "allow_always",
-              _meta: {
-                permission: permissionMetadataForAlwaysAllow(suggestions, toolName),
-              },
-            },
-          ],
+          ...presentation,
+          options: permissionOptions,
           sessionId,
-          toolCall: {
-            toolCallId: toolUseID,
-            rawInput: toolInput,
-            ...toolInfoFromToolUse(
-              { name: toolName, input: toolInput, id: toolUseID },
-              supportsTerminalOutput,
-              session?.cwd,
-            ),
-            // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-            // so clients can rely on one shape everywhere.
-            ...(parentToolUseId
-              ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-              : {}),
-          },
         },
         toolName,
         signal,
         parentToolUseId,
       );
-      if (signal.aborted || response.outcome?.outcome === "cancelled") {
-        throw new Error("Tool use aborted");
+      if (signal.aborted) throw new Error("Tool use aborted");
+      const { permissionResult, contextResetMode: clearContextMode } =
+        decodeClaudePermissionResponse(
+          response,
+          toolName,
+          toolInput,
+          toolUseID,
+          permissionOptions,
+          durableChangeSet,
+        );
+      if (toolName === "ExitPlanMode" && clearContextMode) {
+        const plan = typeof toolInput.plan === "string" ? toolInput.plan.trim() : "";
+        if (!plan) throw new Error("ExitPlanMode clear-context selection requires a plan");
+        session.pendingExitPlanContextReset = {
+          toolUseId: toolUseID,
+          plan,
+          mode: clearContextMode,
+        };
       }
       if (
-        response.outcome?.outcome === "selected" &&
-        (response.outcome.optionId === "allow" || response.outcome.optionId === "allow_always")
+        toolName === "ExitPlanMode" &&
+        permissionResult.behavior === "deny" &&
+        permissionResult.interrupt === true
       ) {
-        // If Claude Code has suggestions, it will update their settings already
-        if (response.outcome.optionId === "allow_always") {
-          return {
-            behavior: "allow",
-            updatedInput: toolInput,
-            updatedPermissions: suggestions ?? [
-              {
-                type: "addRules",
-                rules: [{ toolName }],
-                behavior: "allow",
-                destination: "session",
-              },
-            ],
-          };
-        }
-        return {
-          behavior: "allow",
-          updatedInput: toolInput,
-        };
-      } else {
-        return {
-          behavior: "deny",
-          message: "User refused permission to run tool",
+        session.pendingExitPlanModeInterruption = {
+          toolUseId: toolUseID,
+          toolResultSeen: false,
         };
       }
+      return permissionResult;
     };
   }
 
@@ -6149,7 +6062,12 @@ export class ClaudeAcpAgent {
 
   private async createSession(
     params: NewSessionRequest,
-    creationOpts: { resume?: string; forkSession?: boolean } = {},
+    creationOpts: {
+      resume?: string;
+      forkSession?: boolean;
+      publicSessionId?: string;
+      permissionMode?: PermissionMode;
+    } = {},
   ): Promise<NewSessionResponse> {
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -6161,7 +6079,9 @@ export class ClaudeAcpAgent {
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
     let sessionId;
-    if (creationOpts.forkSession) {
+    if (creationOpts.publicSessionId) {
+      sessionId = creationOpts.publicSessionId;
+    } else if (creationOpts.forkSession) {
       sessionId = randomUUID();
     } else if (creationOpts.resume) {
       sessionId = creationOpts.resume;
@@ -6226,6 +6146,7 @@ export class ClaudeAcpAgent {
       settingsManager.getSettings().permissions?.defaultMode,
       this.logger,
     );
+    const initialPermissionMode = creationOpts.permissionMode ?? permissionMode;
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
@@ -6369,7 +6290,7 @@ export class ClaudeAcpAgent {
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
-      permissionMode,
+      permissionMode: initialPermissionMode,
       canUseTool: this.canUseTool(sessionId),
       // Forward MCP elicitation requests onto ACP elicitation. Only attached
       // when the client advertised support, so non-supporting clients keep the
@@ -6457,7 +6378,8 @@ export class ClaudeAcpAgent {
           },
         ],
       },
-      ...creationOpts,
+      ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
+      ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
       abortController,
     };
 
@@ -6469,7 +6391,7 @@ export class ClaudeAcpAgent {
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
-      options.sessionId = sessionId;
+      options.sessionId = creationOpts.publicSessionId ? randomUUID() : sessionId;
     }
 
     // Handle abort controller from meta options
@@ -6576,7 +6498,7 @@ export class ClaudeAcpAgent {
     // `setPermissionMode`. Keep `permissionMode` as the resolved user intent
     // (matches what was passed into `options.permissionMode` above) and use
     // `effectiveMode` for the post-clamp value the session actually runs in.
-    let effectiveMode: PermissionMode = permissionMode;
+    let effectiveMode: PermissionMode = initialPermissionMode;
     if (!availableModes.some((m) => m.id === effectiveMode)) {
       if (effectiveMode === "auto") {
         this.logger.error(
@@ -6961,47 +6883,40 @@ function isValidBaseUrl(baseUrl: string): boolean {
  * `auto`. `bypassPermissions` is still gated by `ALLOW_BYPASS`.
  */
 function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState["availableModes"] {
-  const modes: SessionModeState["availableModes"] = [];
+  const modes: SessionModeState["availableModes"] = [
+    {
+      // Claude Code 2.1.200 renamed this mode to "Manual" across its surfaces;
+      // the wire id stays "default" ("manual" is only an accepted input alias).
+      id: "default",
+      name: "Manual",
+      description: "Always ask before making changes",
+    },
+    {
+      id: "acceptEdits",
+      name: "Accept edits",
+      description: "Automatically accept all file edits",
+    },
+    {
+      id: "plan",
+      name: "Plan",
+      description: "Create a plan before making changes",
+    },
+  ];
 
   // Only advertise "auto" when the SDK reports the model supports it.
   if (modelInfo?.supportsAutoMode === true) {
     modes.push({
       id: "auto",
       name: "Auto",
-      description: "Use a model classifier to approve/deny permission prompts",
+      description: "Claude handles permission decisions",
     });
   }
-
-  modes.push(
-    {
-      // Claude Code 2.1.200 renamed this mode to "Manual" across its surfaces;
-      // the wire id stays "default" ("manual" is only an accepted input alias).
-      id: "default",
-      name: "Manual",
-      description: "Standard behavior, prompts for dangerous operations",
-    },
-    {
-      id: "acceptEdits",
-      name: "Accept Edits",
-      description: "Auto-accept file edit operations",
-    },
-    {
-      id: "plan",
-      name: "Plan Mode",
-      description: "Planning mode, no actual tool execution",
-    },
-    {
-      id: "dontAsk",
-      name: "Don't Ask",
-      description: "Don't prompt for permissions, deny if not pre-approved",
-    },
-  );
 
   if (ALLOW_BYPASS) {
     modes.push({
       id: "bypassPermissions",
-      name: "Bypass Permissions",
-      description: "Bypass all permission checks",
+      name: "Bypass permissions",
+      description: "Accepts all permissions",
     });
   }
 
@@ -7040,8 +6955,6 @@ export const BUILTIN_AGENT_NAMES = new Set([
 // reserved sentinel: a custom agent named exactly this would collide with it
 // (two options sharing the value, selection silently routing to `null`), so we
 // exclude that name from discovery.
-export const DEFAULT_AGENT_ID = "default";
-
 /** Discover user/plugin/project-configured main-thread agents, excluding the
  *  built-in subagents and the reserved "default" sentinel. Returns an empty
  *  list if discovery fails so a flaky control request never blocks session
@@ -7061,7 +6974,6 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
  *  same identifiers and can't drift apart. */
 export const MODE_CONFIG_ID = "mode";
 export const MODEL_CONFIG_ID = "model";
-export const EFFORT_CONFIG_ID = "effort";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
 
@@ -8086,36 +7998,6 @@ function streamedInputRefinement(
   };
 }
 
-/** Validates the SDK user message's `tool_result_meta` sidecar (emitted on the
- *  wire by CLI ≥ 2.1.216 but absent from sdk.d.ts, hence unknown-typed) into a
- *  by-tool_use_id lookup. Each entry explains why an is_error tool_result
- *  carries harness prose instead of the tool's own output — "user-rejected",
- *  "permission-rule", "interrupted", "cancelled", … (open set: new kinds ship
- *  on the wire ahead of schema updates, so no enum check). Malformed entries
- *  are skipped rather than failing the message. */
-function parseToolResultMeta(
-  raw: unknown,
-): Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined {
-  if (!Array.isArray(raw)) {
-    return undefined;
-  }
-  let byToolUseId: Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined;
-  for (const entry of raw) {
-    if (typeof entry !== "object" || entry === null) {
-      continue;
-    }
-    const { id, non_execution_kind, user_feedback } = entry as Record<string, unknown>;
-    if (typeof id !== "string" || typeof non_execution_kind !== "string") {
-      continue;
-    }
-    (byToolUseId ??= new Map()).set(id, {
-      nonExecutionKind: non_execution_kind,
-      ...(typeof user_feedback === "string" ? { userFeedback: user_feedback } : {}),
-    });
-  }
-  return byToolUseId;
-}
-
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -8523,7 +8405,12 @@ export function toAcpNotifications(
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
-            rawOutput: chunk.content,
+            // terminal_output already carried the exact bytes in the preceding
+            // update. Repeating them as rawOutput wastes bandwidth and lets a
+            // client accidentally render the same output twice.
+            ...(toolMeta?.terminal_output
+              ? {}
+              : { rawOutput: exitPlanModeRawOutput(toolUse.name, chunk.content) }),
             ...toolUpdate,
           };
         }

@@ -51,6 +51,7 @@ import {
   deleteSession,
   getSessionInfo,
   getSessionMessages,
+  PermissionUpdate,
   query,
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -2508,6 +2509,141 @@ describe("permission request cancellation", () => {
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
 
+  it("does not wait for a permission client that ignores cancellation", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: () => new Promise<RequestPermissionResponse>(() => {}),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-1");
+
+    const controller = new AbortController();
+    const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: controller.signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("Tool use aborted");
+  });
+
+  it("observes a client rejection when the signal aborts during request creation", async () => {
+    const controller = new AbortController();
+    const clientOperation = Promise.reject(new Error("Request cancelled"));
+    const then = vi.spyOn(clientOperation, "then");
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: () => {
+        controller.abort();
+        return clientOperation;
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: controller.signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).rejects.toThrow("Tool use aborted");
+
+    expect(then).toHaveBeenCalledOnce();
+  });
+
+  it("does not wait for an eager tool-call update that ignores cancellation", async () => {
+    const requestPermission = vi.fn();
+    const mockClient = {
+      sessionUpdate: () => new Promise<void>(() => {}),
+      requestPermission,
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    const controller = new AbortController();
+
+    const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: controller.signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("Tool use aborted");
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(session.emittedToolCalls.has("tool-1")).toBe(false);
+  });
+
+  it("clears pending ExitPlanMode state even after the query has closed", async () => {
+    const mockClient = { sessionUpdate: vi.fn() } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.queryClosed = true;
+    session.pendingExitPlanModeInterruption = {
+      toolUseId: "tool-plan",
+      toolResultSeen: false,
+    };
+    session.pendingExitPlanContextReset = {
+      toolUseId: "tool-plan",
+      plan: "Ship it",
+      mode: "auto",
+    };
+
+    await agent.cancel({ sessionId: "session-1" });
+
+    expect(session.cancelled).toBe(true);
+    expect(session.pendingExitPlanModeInterruption).toBeUndefined();
+    expect(session.pendingExitPlanContextReset).toBeUndefined();
+  });
+
+  it("does not emit or request permission for a pre-aborted tool call", async () => {
+    const sessionUpdate = vi.fn();
+    const requestPermission = vi.fn();
+    const mockClient = { sessionUpdate, requestPermission } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: controller.signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).rejects.toThrow("Tool use aborted");
+    expect(sessionUpdate).not.toHaveBeenCalled();
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(session.emittedToolCalls.has("tool-1")).toBe(false);
+  });
+
+  it("allows a streamed tool call to retry after eager emission fails", async () => {
+    const requestPermission = vi.fn();
+    const mockClient = {
+      sessionUpdate: async () => {
+        throw new Error("transport failed");
+      },
+      requestPermission,
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).rejects.toThrow("transport failed");
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(session.emittedToolCalls.has("tool-1")).toBe(false);
+  });
+
   it("treats a cancelled permission outcome as an aborted tool use", async () => {
     const mockClient = {
       sessionUpdate: async () => {},
@@ -2525,7 +2661,7 @@ describe("permission request cancellation", () => {
     ).rejects.toThrow("Tool use aborted");
   });
 
-  it("offers the approval actions in deny, once, always order with human-readable labels", async () => {
+  it("omits the durable action when Claude supplies no permission update", async () => {
     let request: RequestPermissionRequest | undefined;
     const mockClient = {
       sessionUpdate: async () => {},
@@ -2544,32 +2680,224 @@ describe("permission request cancellation", () => {
     } as any);
 
     expect(request?.options).toEqual([
-      { kind: "reject_once", name: "Deny", optionId: "reject" },
-      { kind: "allow_once", name: "Allow Once", optionId: "allow" },
-      {
-        kind: "allow_always",
-        name: "Always Allow",
-        optionId: "allow_always",
-        _meta: {
-          permission: {
-            version: 1,
-            changes: [
-              {
-                type: "policy_rule",
-                operation: "add",
-                ruleBehavior: "allow",
-                description: "Allow all Bash calls",
-                lifetime: { scope: "session" },
-                targets: [{ type: "tool", toolName: "Bash" }],
-              },
-            ],
-          },
-        },
+      { kind: "allow_once", name: "Yes", optionId: "allow-once" },
+      { kind: "reject_once", name: "No", optionId: "reject" },
+    ]);
+    expect(request?._meta).toEqual({
+      permission: { version: 1, title: "Bash" },
+    });
+  });
+
+  it("maps explicit reject to deny while retaining Claude classification", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).resolves.toEqual({
+      behavior: "deny",
+      message: "User refused permission to run tool",
+      toolUseID: "tool-1",
+      decisionClassification: "user_reject",
+    });
+  });
+
+  it("interrupts the turn after an ExitPlanMode keep-planning rejection", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+
+    await expect(
+      agent.canUseTool("session-1")("ExitPlanMode", { plan: "Implement it" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+      } as any),
+    ).resolves.toEqual({
+      behavior: "deny",
+      message: "User chose to keep planning",
+      interrupt: true,
+      toolUseID: "tool-plan",
+      decisionClassification: "user_reject",
+    });
+    expect(session.pendingExitPlanModeInterruption).toEqual({
+      toolUseId: "tool-plan",
+      toolResultSeen: false,
+    });
+  });
+
+  it("offers ExitPlanMode clear-context with measured usage and records the handoff", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (value: RequestPermissionRequest) => {
+        request = value;
+        return {
+          outcome: { outcome: "selected", optionId: "exit-plan-clear-auto" },
+        } as RequestPermissionResponse;
       },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.modes.availableModes = [
+      { id: "default", name: "Manual" },
+      { id: "acceptEdits", name: "Accept edits" },
+      { id: "auto", name: "Auto" },
+    ];
+    session.contextUsedTokens = 150_000;
+    session.contextWindowSize = 200_000;
+
+    await expect(
+      agent.canUseTool("session-1")("ExitPlanMode", { plan: "Implement it" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+      } as any),
+    ).resolves.toMatchObject({ behavior: "deny", interrupt: true });
+
+    expect(request?.options).toContainEqual({
+      optionId: "exit-plan-clear-auto",
+      name: "Yes, clear context (75% used) and use auto mode",
+      kind: "allow_always",
+    });
+    expect(session.pendingExitPlanContextReset).toEqual({
+      toolUseId: "tool-plan",
+      plan: "Implement it",
+      mode: "auto",
+    });
+  });
+
+  it("maps Claude presentation fields without reconstructing provider text or changing input", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (value: RequestPermissionRequest) => {
+        request = value;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+    const input = { file_path: "/outside/a.ts" };
+
+    const result = await agent.canUseTool("session-1")("Read", input, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+      requestId: "claude-request-1",
+      title: "Claude wants to read /outside/a.ts",
+      displayName: "Read file",
+      description: "Read a.ts",
+      decisionReason: "Needed to inspect the dependency.",
+      blockedPath: "/outside/a.ts",
+    });
+
+    expect(request?._meta).toEqual({
+      permission: {
+        version: 1,
+        title: "Read /outside/a.ts",
+        description: "Reason: Needed to inspect the dependency.",
+      },
+    });
+    expect(request?.toolCall).toMatchObject({
+      kind: "read",
+      rawInput: input,
+      locations: [{ path: "/outside/a.ts", line: 1 }],
+    });
+    expect(request?.toolCall.rawInput).toBe(input);
+    expect(result?.behavior === "allow" && result.updatedInput).toBe(input);
+  });
+
+  it("keeps concurrent permission requests independent even for the same tool call", async () => {
+    const requests: RequestPermissionRequest[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (request: RequestPermissionRequest) => {
+        requests.push(request);
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-shared");
+
+    const canUseTool = agent.canUseTool("session-1");
+    await Promise.all([
+      canUseTool("Bash", { command: "one" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-shared",
+      } as any),
+      canUseTool("Bash", { command: "two" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-shared",
+      } as any),
+    ]);
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map((request) => request.toolCall.rawInput)).toEqual([
+      { command: "one" },
+      { command: "two" },
     ]);
   });
 
-  it("attaches structured permission changes to the always-allow ACP option", async () => {
+  it("applies the exact representable provider updates described by the selected option", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const updates: PermissionUpdate[] = [
+      {
+        type: "addRules",
+        rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+        behavior: "allow",
+        destination: "session",
+      },
+      {
+        type: "addDirectories",
+        directories: ["/tmp/work"],
+        destination: "session",
+      },
+    ];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-with-updates" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "npm test" }, {
+      signal: new AbortController().signal,
+      suggestions: updates,
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(result?.behavior).toBe("allow");
+    if (!result || result.behavior !== "allow") throw new Error("expected allow result");
+    expect(result.updatedPermissions).toEqual(updates);
+    const option = request?.options.find(
+      (candidate) => candidate.optionId === "allow-with-updates",
+    );
+    expect(option).toEqual({
+      kind: "allow_always",
+      name: "Yes, and allow access to work/ and npm test commands",
+      optionId: "allow-with-updates",
+    });
+  });
+
+  it("keeps provider permission effects inside the adapter", async () => {
     let request: RequestPermissionRequest | undefined;
     const mockClient = {
       sessionUpdate: async () => {},
@@ -2599,47 +2927,12 @@ describe("permission request cancellation", () => {
       toolUseID: "tool-1",
     } as any);
 
-    expect(request?.options.find((option) => option.optionId === "allow_always")?._meta).toEqual({
-      permission: {
-        version: 1,
-        changes: [
-          {
-            type: "policy_rule",
-            operation: "add",
-            ruleBehavior: "allow",
-            description: "Allow Bash calls matching npm test:*",
-            lifetime: { scope: "session" },
-            targets: [
-              {
-                type: "tool",
-                toolName: "Bash",
-                matcher: {
-                  type: "provider_rule",
-                  provider: "claudeCode",
-                  value: "npm test:*",
-                },
-              },
-            ],
-          },
-          {
-            type: "policy_rule",
-            operation: "add",
-            ruleBehavior: "allow",
-            description: "Allow filesystem access under /tmp/work",
-            lifetime: { scope: "session" },
-            targets: [
-              {
-                type: "filesystem",
-                matcher: { type: "directory", path: "/tmp/work" },
-              },
-            ],
-          },
-        ],
-      },
-    });
+    expect(
+      request?.options.find((option) => option.optionId === "allow-with-updates")?._meta,
+    ).toBeUndefined();
   });
 
-  it("preserves replace, remove, deny, destination, and mode suggestion semantics", async () => {
+  it("does not expose an update bundle that Claude's Bash dialog cannot label", async () => {
     let request: RequestPermissionRequest | undefined;
     const mockClient = {
       sessionUpdate: async () => {},
@@ -2674,50 +2967,7 @@ describe("permission request cancellation", () => {
       toolUseID: "tool-1",
     } as any);
 
-    expect(
-      (request?.options.find((option) => option.optionId === "allow_always")?._meta as any)
-        ?.permission.changes,
-    ).toEqual([
-      {
-        type: "policy_rule",
-        operation: "replace",
-        ruleBehavior: "deny",
-        description: "Replace deny rules with Bash calls matching rm generated.txt",
-        lifetime: { scope: "persistent", storage: "project" },
-        targets: [
-          {
-            type: "tool",
-            toolName: "Bash",
-            matcher: {
-              type: "provider_rule",
-              provider: "claudeCode",
-              value: "rm generated.txt",
-            },
-          },
-        ],
-      },
-      {
-        type: "policy_rule",
-        operation: "remove",
-        ruleBehavior: "allow",
-        description: "Remove additional filesystem access under /tmp/old",
-        lifetime: { scope: "persistent", storage: "project_local" },
-        targets: [
-          {
-            type: "filesystem",
-            matcher: { type: "directory", path: "/tmp/old" },
-          },
-        ],
-      },
-      {
-        type: "permission_mode",
-        operation: "set",
-        provider: "claudeCode",
-        mode: "default",
-        description: "Set Claude Code permission mode to default",
-        lifetime: { scope: "session" },
-      },
-    ]);
+    expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
   });
 });
 
@@ -2737,7 +2987,7 @@ describe("tool_call emitted before permission request", () => {
       },
       requestPermission: async () => {
         events.push("permission");
-        return { outcome: { outcome: "selected", optionId: "allow" } };
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
@@ -3021,7 +3271,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       sessionUpdate: async () => {},
       requestPermission: async () => {
         events.push("permission");
-        return { outcome: { outcome: "selected", optionId: "allow" } };
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
@@ -3034,17 +3284,18 @@ describe("canUseTool in bypassPermissions mode", () => {
     return { agent, events };
   }
 
-  it("auto-allows asks that carry no matchedAskRule", async () => {
+  it("prompts for asks that survive Claude Code's bypass evaluation", async () => {
     const { agent, events } = setup();
 
     const result = await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
       signal: new AbortController().signal,
       suggestions: [],
       toolUseID: "tool-1",
+      decisionReason: "This action requires interactive safety approval.",
     } as any);
 
-    expect(events).toEqual([]);
-    expect(result).toMatchObject({ behavior: "allow" });
+    expect(events).toEqual(["permission"]);
+    expect(result).toMatchObject({ behavior: "allow", toolUseID: "tool-1" });
   });
 
   // The asks that still reach canUseTool in bypass mode are the ones the CLI
@@ -3069,6 +3320,35 @@ describe("canUseTool in bypassPermissions mode", () => {
     expect(events).toEqual(["permission"]);
     expect(result).toMatchObject({ behavior: "allow" });
   });
+
+  it("does not promise an ineffective always-allow fallback for a forced ask rule", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState({
+      modes: { currentModeId: "bypassPermissions", availableModes: [] },
+    });
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "terraform destroy" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+      matchedAskRule: {
+        source: "projectSettings",
+        toolName: "Bash",
+        ruleContent: "Bash(terraform:*)",
+      },
+    } as any);
+
+    expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
+  });
 });
 
 describe("subagent permission attribution (issue #851)", () => {
@@ -3088,7 +3368,7 @@ describe("subagent permission attribution (issue #851)", () => {
       },
       requestPermission: async (params: RequestPermissionRequest) => {
         requests.push(params);
-        return { outcome: { outcome: "selected", optionId: "allow" } };
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log, error: () => {} });
@@ -3115,9 +3395,8 @@ describe("subagent permission attribution (issue #851)", () => {
       toolCallId: "toolu_sub",
       _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
-    // The request's claudeCode meta keeps the shape every other claudeCode
-    // meta has (toolName is required by ToolUpdateMeta).
-    expect(requests[0].toolCall._meta).toMatchObject({
+    // Keep the stable claudeCode metadata shape while adding the parent link.
+    expect(requests[0].toolCall._meta).toEqual({
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
     });
   });
@@ -11777,6 +12056,18 @@ describe("turn steering (_session/steering)", () => {
     };
   }
 
+  function createExecutionErrorResult(errors: string[]) {
+    const base: Partial<ReturnType<typeof createResultMessage>> = { ...createResultMessage() };
+    delete base.result;
+    return {
+      ...base,
+      subtype: "error_during_execution" as const,
+      stop_reason: null,
+      is_error: true,
+      errors,
+    };
+  }
+
   // A minimal SDK assistant message carrying a single text block. Used by the
   // promptRequired retry test to model the continuation turn's streamed reply.
   function createAssistantText(text: string) {
@@ -12509,6 +12800,336 @@ describe("turn steering (_session/steering)", () => {
     });
 
     await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
+  it("maps the correlated ExitPlanMode interrupt diagnostic to cancellation", async () => {
+    const updates: any[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: any) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        yield {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "tool-plan",
+                name: "ExitPlanMode",
+                input: { plan: "Implement it" },
+              },
+            ],
+            usage: {},
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "tool-plan",
+                content: "User chose to keep planning",
+                is_error: true,
+              },
+            ],
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+        };
+        // An interrupted Claude cycle is error-shaped. The causal stop reason
+        // is present only in errors; SDKResultError has no result property.
+        yield createExecutionErrorResult([
+          "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        ]);
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+    expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
+  });
+
+  it("continues an accepted plan in a fresh private query without exposing the internal reject", async () => {
+    const updates: any[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: any) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    let continuation: unknown;
+    const createSession = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async (_params: any, options: any) => {
+        const input = new Pushable<any>();
+        async function* freshGenerator() {
+          const next = await input[Symbol.asyncIterator]().next();
+          continuation = next.value;
+          yield userEcho(next.value);
+          yield createAssistantText("Implemented");
+          yield createResultMessage();
+          yield idleMessage();
+        }
+        agent.sessions["test-session"] = mockSessionState({
+          query: wrapQuery(freshGenerator()),
+          input,
+          modes: { currentModeId: options.permissionMode, availableModes: [] },
+          fastModeEnabled: false,
+        });
+        return { sessionId: "test-session" };
+      });
+
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* oldGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const original = await iter.next();
+          yield userEcho(original.value);
+          yield {
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "tool-plan",
+                  name: "ExitPlanMode",
+                  input: { plan: "Implement it" },
+                },
+              ],
+              usage: {},
+            },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+          yield {
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "tool-plan",
+                  content: "User accepted the plan and requested a fresh context",
+                  is_error: true,
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+          };
+          yield createExecutionErrorResult([
+            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+          ]);
+        }
+        return oldGenerator();
+      },
+      {
+        creationParams: { cwd: "/test", mcpServers: [] },
+        pendingExitPlanModeInterruption: {
+          toolUseId: "tool-plan",
+          toolResultSeen: false,
+        },
+        pendingExitPlanContextReset: {
+          toolUseId: "tool-plan",
+          plan: "Implement it",
+          mode: "auto",
+        },
+      },
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: "/test" }),
+      expect.objectContaining({ publicSessionId: "test-session", permissionMode: "auto" }),
+    );
+    expect(JSON.stringify(continuation)).toContain(
+      "Implement the following plan:\\n\\nImplement it",
+    );
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tool-plan",
+          status: "completed",
+        }),
+      }),
+    );
+    expect(JSON.stringify(updates)).not.toContain('"status":"failed"');
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it("rejects the pending turn if a fresh clear-context query cannot be created", async () => {
+    const agent = createMockAgent();
+    vi.spyOn(agent as any, "createSession").mockRejectedValue(new Error("restart failed"));
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const original = await iter.next();
+          yield userEcho(original.value);
+          yield {
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "tool-plan",
+                  content: "User accepted the plan and requested a fresh context",
+                  is_error: true,
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+          yield createExecutionErrorResult([
+            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+          ]);
+        }
+        return messageGenerator();
+      },
+      {
+        creationParams: { cwd: "/test", mcpServers: [] },
+        pendingExitPlanModeInterruption: {
+          toolUseId: "tool-plan",
+          toolResultSeen: true,
+        },
+        pendingExitPlanContextReset: {
+          toolUseId: "tool-plan",
+          plan: "Implement it",
+          mode: "auto",
+        },
+      },
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] }),
+    ).rejects.toThrow("restart failed");
+  });
+
+  it("does not resurrect a clear-context session closed while its replacement is created", async () => {
+    const agent = createMockAgent();
+    const resolveTurn = vi.fn();
+    const rejectTurn = vi.fn();
+    const turn = {
+      promptUuid: randomUUID(),
+      isLocalOnlyCommand: false,
+      settled: false,
+      resolve: resolveTurn,
+      reject: rejectTurn,
+    };
+    const oldSession = mockSessionState({
+      query: wrapQuery(
+        (async function* () {
+          yield await new Promise<never>(() => {});
+        })(),
+      ),
+      input: new Pushable(),
+      activeTurn: turn,
+      turnQueue: [turn],
+      creationParams: { cwd: "/test", mcpServers: [] },
+    });
+    agent.sessions["test-session"] = oldSession;
+    let finishCreation!: () => void;
+    let freshSession: ReturnType<typeof mockSessionState> | undefined;
+    let freshInputPush: ReturnType<typeof vi.fn> | undefined;
+    vi.spyOn(agent as any, "createSession").mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishCreation = () => {
+            const freshInput = new Pushable();
+            freshInputPush = vi.spyOn(freshInput, "push");
+            freshSession = mockSessionState({
+              query: wrapQuery(
+                (async function* () {
+                  yield await new Promise<never>(() => {});
+                })(),
+              ),
+              input: freshInput,
+              modes: { currentModeId: "auto", availableModes: [] },
+            });
+            agent.sessions["test-session"] = freshSession;
+            resolve();
+          };
+        }),
+    );
+
+    const restart = (agent as any).exitPlan.restart("test-session", oldSession, {
+      toolUseId: "tool-plan",
+      plan: "Ship it",
+      mode: "auto",
+    });
+    await vi.waitFor(() => expect(oldSession.query.close).toHaveBeenCalled());
+
+    await agent.closeSession({ sessionId: "test-session" });
+    finishCreation();
+    await expect(restart).resolves.toBeUndefined();
+
+    expect(agent.sessions["test-session"]).toBeUndefined();
+    expect(freshSession?.query.close).toHaveBeenCalled();
+    expect(freshInputPush).not.toHaveBeenCalled();
+    expect(resolveTurn).toHaveBeenCalledWith(expect.objectContaining({ stopReason: "cancelled" }));
+    expect(rejectTurn).not.toHaveBeenCalled();
+  });
+
+  it("does not hide a diagnostic before the rejected ExitPlanMode tool result", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const original = await iter.next();
+          yield userEcho(original.value);
+          yield createExecutionErrorResult([
+            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+          ]);
+          yield idleMessage();
+        }
+        return messageGenerator();
+      },
+      {
+        pendingExitPlanModeInterruption: {
+          toolUseId: "tool-plan",
+          toolResultSeen: false,
+        },
+      },
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] }),
+    ).rejects.toThrow("[ede_diagnostic]");
+    expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
   });
 
   // The other steer ordering: the cycle had already finished when the steer
@@ -13525,7 +14146,7 @@ describe("streamEventToAcpNotifications", () => {
         type: "server_tool_use" as const,
         partialJson:
           '{"query":"ACP tools","allowed_domains":["agentclientprotocol.com","github.com"],"blocked_domains":',
-        title: '"ACP tools" (allowed: agentclientprotocol.com, github.com)',
+        title: 'Search "ACP tools"',
         rawInput: {
           query: "ACP tools",
           allowed_domains: ["agentclientprotocol.com", "github.com"],
