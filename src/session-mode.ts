@@ -12,7 +12,6 @@ import type {
   PermissionResult,
   Query,
 } from "@anthropic-ai/claude-agent-sdk";
-import { ALLOW_BYPASS } from "./permissions/modes.js";
 
 export const MODE_CONFIG_ID = "mode";
 export const AUTO_MODE_FALLBACK: PermissionMode = "acceptEdits";
@@ -49,6 +48,8 @@ type InitializeSessionModeParams = {
   requestedMode: PermissionMode;
   currentModelInfo?: ModelInfo;
   currentModelId: string;
+  /** When false, bypassPermissions is omitted from the mode catalog. */
+  allowBypass: boolean;
 };
 
 /** Owns session-mode policy and the ACP/SDK synchronization it requires. */
@@ -60,11 +61,12 @@ export class SessionModeManager<S extends SessionMode> {
     requestedMode,
     currentModelInfo,
     currentModelId,
+    allowBypass,
   }: InitializeSessionModeParams): Promise<{
     modes: SessionModeState;
     autoModeFallbackWarningPending: boolean;
   }> {
-    const availableModes = this.buildAvailableModes();
+    const availableModes = this.buildAvailableModes(allowBypass);
     let effectiveMode = requestedMode;
     let autoModeFallbackWarningPending = false;
 
@@ -281,7 +283,7 @@ export class SessionModeManager<S extends SessionMode> {
     }
   }
 
-  private buildAvailableModes(): SessionModeState["availableModes"] {
+  private buildAvailableModes(allowBypass: boolean): SessionModeState["availableModes"] {
     const modes: SessionModeState["availableModes"] = [
       {
         id: "default",
@@ -308,7 +310,7 @@ export class SessionModeManager<S extends SessionMode> {
         _meta: { kind: "auto_review" },
       },
     ];
-    if (ALLOW_BYPASS) {
+    if (allowBypass) {
       modes.push({
         id: "bypassPermissions",
         name: "Bypass permissions",

@@ -7,6 +7,7 @@ import {
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { ALLOW_BYPASS } from "../permissions/modes.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -94,6 +95,17 @@ describe("createSession options merging", () => {
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  describe("allowDangerouslySkipPermissions", () => {
+    it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(ALLOW_BYPASS);
+      expect(response.modes!.availableModes.some((mode) => mode.id === "bypassPermissions")).toBe(
+        ALLOW_BYPASS,
+      );
+    });
   });
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {
