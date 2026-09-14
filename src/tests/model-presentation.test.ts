@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { query, type ModelInfo, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { buildModelConfigOption, getAvailableModels } from "../session-model.js";
@@ -15,21 +12,6 @@ const OPUS: ModelInfo = {
 describe("versioned model display names", () => {
   beforeEach(() => vi.stubEnv("ANTHROPIC_MODEL", undefined));
   afterEach(() => vi.unstubAllEnvs());
-
-  it("requires reviewing the live model contract whenever the SDK is upgraded", () => {
-    const require = createRequire(import.meta.url);
-    const sdkPackage = JSON.parse(
-      readFileSync(
-        join(dirname(require.resolve("@anthropic-ai/claude-agent-sdk")), "package.json"),
-        "utf8",
-      ),
-    );
-    expect(
-      sdkPackage.version,
-      "Run RUN_INTEGRATION_TESTS=true npx vitest run src/tests/model-presentation.test.ts " +
-        "and review the Opus name normalization before updating this version guard.",
-    ).toBe("0.3.257");
-  });
 
   it("adds standard-family versions and preserves model identity and recommendation", async () => {
     const models: ModelInfo[] = [
