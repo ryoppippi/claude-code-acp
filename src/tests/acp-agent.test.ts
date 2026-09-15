@@ -3376,7 +3376,6 @@ describe("permission request cancellation", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
-      fileChangeReportRequestIds: new Set(),
     } as any;
     return agent.sessions[sessionId]!;
   }
@@ -8920,7 +8919,6 @@ describe("session/close", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -9014,7 +9012,6 @@ describe("session/delete", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -9125,7 +9122,6 @@ describe("getOrCreateSession param change detection", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -11686,62 +11682,6 @@ describe("assembled assistant text fallback", () => {
     );
   });
 
-  it("ends a dangling replayed audit lane at a compaction summary", async () => {
-    // A Stop-hook audit whose result was never persisted must not hide the
-    // post-compaction history from a client on the compaction contract.
-    const { agent, updates } = compactionCapableAgent();
-    agent.sessions["test-session"] = mockSessionState();
-    vi.mocked(getSessionMessages).mockResolvedValueOnce([
-      {
-        type: "user",
-        uuid: "audit-marker",
-        session_id: "test-session",
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        message: {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "<claude-agent-acp-file-change-audit>report now</claude-agent-acp-file-change-audit>",
-            },
-          ],
-        },
-      },
-      {
-        type: "user",
-        uuid: "compact-summary",
-        session_id: "test-session",
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        isCompactSummary: true,
-        message: {
-          role: "user",
-          content:
-            "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nCounted.",
-        },
-      },
-      {
-        type: "assistant",
-        uuid: "after",
-        session_id: "test-session",
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        message: {
-          role: "assistant",
-          model: "claude-sonnet-4-6",
-          content: [{ type: "text", text: "Back after compaction." }],
-        },
-      },
-    ] as any);
-
-    await (agent as any).replaySessionHistory("test-session");
-
-    const kinds = updates.map((notification) => notification.update.sessionUpdate);
-    expect(kinds).toContain("compaction_update");
-    expect(messageChunkTexts(updates)).toEqual(["Back after compaction."]);
-  });
-
   it("preserves the model response after multiple compactions in one turn", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -12701,7 +12641,6 @@ describe("post-error recovery", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return { interrupt };
   }
@@ -14991,25 +14930,36 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // deferral gate, or the subagent's remaining work is stranded
     // out-of-turn through the refusal lane.
     const agent = createMockAgent();
+    const report = vi.fn(async () => {});
     let releaseDrain!: () => void;
     const drainGate = new Promise<void>((resolve) => (releaseDrain = resolve));
 
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        yield running();
-        yield subagentStarted("agent-1");
-        yield resultMessage({ stop_reason: "refusal" }); // held, not settled
-        yield idle();
-        await drainGate;
-        yield taskNotification("agent-1");
-        yield resultMessage({ origin: { kind: "task-notification" } }); // settles
-        yield idle();
-      }
-      return messageGenerator();
-    });
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: userMessage } = await iter.next();
+          yield userEcho(userMessage);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage({ stop_reason: "refusal" }); // held, not settled
+          yield idle();
+          await drainGate;
+          yield taskNotification("agent-1");
+          yield resultMessage({ origin: { kind: "task-notification" } }); // settles
+          yield idle();
+        }
+        return messageGenerator();
+      },
+      {
+        fileChangeReporter: {
+          request: vi.fn(),
+          report,
+          finish: vi.fn(),
+        },
+      },
+    );
 
     const response = agent.prompt({
       sessionId: "test-session",
@@ -15020,8 +14970,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await waitFor(
       () => agent.sessions["test-session"]?.activeTurn?.deferredSettle?.stopReason === "refusal",
     );
+    expect(report).not.toHaveBeenCalled();
     releaseDrain();
     await expect(response).resolves.toEqual(expect.objectContaining({ stopReason: "refusal" }));
+    expect(report).toHaveBeenCalledTimes(1);
     await agent.sessions["test-session"]?.consumer;
   });
 
@@ -16417,29 +16369,40 @@ describe("turn steering (_session/steering)", () => {
       error: () => {},
     });
 
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const u1 = await iter.next();
-        yield userEcho(u1.value); // turn becomes active
-        yield createAssistantText("working on it");
-        // The steered message is pushed at priority 'now'...
-        const steered = await iter.next();
-        // ...so the CLI aborts the query, ending the interrupted cycle with a
-        // result of its own. No idle follows it: one comes at the very end, for
-        // the whole interrupted + steered sequence.
-        yield interruptedCycleResult();
-        // Only now does the steered message run, as a second cycle. Its echo
-        // matches no queued turn (dropped as an unrelated replay), its output is
-        // the answer the user is waiting for, and its result has the last word
-        // on the turn's stop reason.
-        yield userEcho(steered.value);
-        yield createAssistantText("STEERED-OK");
-        yield createResultMessage();
-        yield idleMessage();
-      }
-      return messageGenerator();
-    });
+    const report = vi.fn(async () => void timeline.push("checkpoint"));
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value); // turn becomes active
+          yield createAssistantText("working on it");
+          // The steered message is pushed at priority 'now'...
+          const steered = await iter.next();
+          // ...so the CLI aborts the query, ending the interrupted cycle with a
+          // result of its own. No idle follows it: one comes at the very end, for
+          // the whole interrupted + steered sequence.
+          yield interruptedCycleResult();
+          // Only now does the steered message run, as a second cycle. Its echo
+          // matches no queued turn (dropped as an unrelated replay), its output is
+          // the answer the user is waiting for, and its result has the last word
+          // on the turn's stop reason.
+          yield userEcho(steered.value);
+          yield createAssistantText("STEERED-OK");
+          yield createResultMessage();
+          yield idleMessage();
+        }
+        return messageGenerator();
+      },
+      {
+        fileChangeReporter: {
+          request: vi.fn(),
+          report,
+          finish: vi.fn(),
+        },
+      },
+    );
 
     const turn = agent
       .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
@@ -16461,7 +16424,8 @@ describe("turn steering (_session/steering)", () => {
     // The steered continuation belongs to the turn the client is waiting on, so
     // all of it precedes that turn's response. A `prompt:` entry anywhere but
     // last is the bug: updates outlived the stopReason.
-    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "checkpoint", "prompt:end_turn"]);
+    expect(report).toHaveBeenCalledTimes(1);
     // Both cycles ran for this one prompt, so its usage covers both (2 × the
     // mock result's 10 in / 5 out) rather than stopping at the interrupt.
     expect(response.usage).toEqual({
@@ -17326,7 +17290,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return { interrupt };
   }
